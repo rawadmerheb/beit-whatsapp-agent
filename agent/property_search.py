@@ -19,25 +19,42 @@ doesn't match, open properties-for-sale/ in a browser, use "Inspect
 Element" on a listing card, and adjust the CSS selectors marked TODO below.
 See README "Fixing the Arkan scraper" for a step-by-step.
 
-ON "ALL AGENCIES AND BROKERS IN LEBANON"
-------------------------------------------
+ON "ALL AGENCIES AND BROKERS IN LEBANON" (AND "GOOGLE")
+--------------------------------------------------------
 There is no single directory or API covering every Lebanese real estate
 agency and broker -- there are hundreds, each with their own website (if
-any). Hand-writing a scraper per agency doesn't scale and breaks constantly.
-Instead, `search_market()` below runs two searches and merges them:
-  1. A curated list of the major Lebanese listing portals (KNOWN_PORTALS) --
-     high-confidence, high-volume sources.
-  2. An *unrestricted* web search (no site filter) for the area/type/
-     transaction -- this is what actually reaches "all agencies and
-     brokers": whichever agency or broker has a page indexed for that
-     search, curated list or not, shows up here.
-Both go through DuckDuckGo's HTML endpoint (no API key required). If you
-later get a real search API (Google Custom Search, Bing, SerpAPI), swap it
-in here for better ranking/coverage -- the merge/dedupe logic stays the
-same.
+any). There's also no free, ongoing "search Google" API for a new project:
+Google closed its Custom Search JSON API to new sign-ups, and the paid
+proxies that front real Google results (Serper, SerpAPI, etc.) only offer a
+one-time free trial before they require a paid plan.
+
+Instead, `search_market()` below runs THREE queries in parallel and merges
+the results:
+  1. A DEDICATED query for OLX (olx.com.lb) -- always run on its own, not
+     bundled into a combined OR filter, so it can't get crowded out by the
+     other portals.
+  2. A combined query for the rest of the curated portal list
+     (OTHER_KNOWN_PORTALS) -- high-confidence, high-volume sources.
+  3. An *unrestricted* open web search (no site filter) for the area/type/
+     transaction -- this is what reaches "everywhere else, including
+     whatever a Google search would surface": whichever agency, broker, or
+     portal has a page indexed for that search shows up here, curated list
+     or not.
+All three go through DuckDuckGo's HTML endpoint (no API key, no signup, no
+cost, no rate-limit surprises for a small pilot). Running them concurrently
+(rather than one after another) keeps the total wait roughly equal to the
+SLOWEST single request instead of the sum of all of them -- important,
+since Arkan's own scrape happens at the same time too.
+
+If you ever want genuine Google-branded results badly enough to accept a
+paid API down the line, see README "Optional: real Google search results"
+for how to wire in a service like Serper.dev -- the merge/dedupe logic
+below doesn't need to change, you'd just add one more query to the list.
 """
 
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
@@ -51,16 +68,25 @@ HEADERS = {
 
 ARKAN_BASE = "https://arkanestate.com"
 
-# Major Lebanese listing portals worth always checking explicitly, in
-# addition to the unrestricted search below. Add more here as you find
-# ones worth including.
-KNOWN_PORTALS = [
-    "olx.com.lb",
+# OLX gets its own guaranteed query (see module docstring) rather than being
+# folded into the combined-portal query below.
+OLX_DOMAIN = "olx.com.lb"
+
+# The rest of the curated Lebanese listing portals worth always checking
+# explicitly, in addition to the unrestricted search below. Add more here as
+# you find ones worth including.
+OTHER_KNOWN_PORTALS = [
     "realestate.com.lb",
     "byootna.com",
     "lebanon.dubizzle.com",
     "lebanon.realigro.com",
 ]
+
+# Per-request timeout. Kept modest because up to 4 of these (Arkan + 3
+# market queries) run concurrently, and a slow/unreachable site shouldn't
+# make the whole reply hang -- better to come back a little short than to
+# leave someone staring at "typing..." for a minute.
+REQUEST_TIMEOUT = 10
 
 
 def _clean_price(text):
@@ -85,7 +111,7 @@ def search_arkan(area, transaction_type="sale", property_type=None,
         # WordPress's built-in search param; Arkan's own filter widget may
         # use different param names -- if you find them (view page source
         # on a filtered search), swap this out for the real ones.
-        resp = requests.get(url, headers=HEADERS, params={"s": area}, timeout=12)
+        resp = requests.get(url, headers=HEADERS, params={"s": area}, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
     except requests.RequestException as e:
         return {"source": "Arkan Estate", "url": url, "error": str(e), "results": []}
@@ -139,13 +165,15 @@ def search_arkan(area, transaction_type="sale", property_type=None,
 
 def _ddg_search(query, limit):
     """One query against DuckDuckGo's no-JS HTML endpoint. Returns a list of
-    {title, url, snippet} dicts, or an empty list on failure."""
+    {title, url, snippet} dicts, or an empty list on failure (never raises --
+    a slow/blocked search engine should degrade gracefully, not break the
+    whole reply)."""
     try:
         resp = requests.post(
             "https://html.duckduckgo.com/html/",
             data={"q": query},
             headers=HEADERS,
-            timeout=12,
+            timeout=REQUEST_TIMEOUT,
         )
         resp.raise_for_status()
     except requests.RequestException:
@@ -167,24 +195,52 @@ def _ddg_search(query, limit):
 
 
 def search_market(area, transaction_type="sale", property_type=None, limit=8):
-    """Search the rest of the Lebanese market beyond Arkan: the known major
-    portals PLUS an unrestricted search with no site filter, so agencies
-    and brokers not on the curated list still surface. Merged and deduped
-    by domain+title."""
+    """Search the rest of the Lebanese market beyond Arkan: a guaranteed OLX
+    query, the other known major portals, and an unrestricted search with no
+    site filter, so agencies/brokers not on the curated list still surface
+    too. All three run concurrently and are merged, deduped by
+    domain+title."""
     kind = "for sale" if transaction_type != "rent" else "for rent"
     ptype = f" {property_type}" if property_type else ""
 
-    site_filter = " OR ".join(f"site:{d}" for d in KNOWN_PORTALS)
-    curated_query = f"{area}{ptype} {kind} Lebanon ({site_filter})"
+    olx_query = f"site:{OLX_DOMAIN} {area}{ptype} {kind} Lebanon"
+    other_site_filter = " OR ".join(f"site:{d}" for d in OTHER_KNOWN_PORTALS)
+    other_portals_query = f"{area}{ptype} {kind} Lebanon ({other_site_filter})"
     open_query = f"{area}{ptype} {kind} Lebanon real estate agency broker listing"
+
+    queries = [olx_query, other_portals_query, open_query]
+
+    # Run all three DuckDuckGo queries at once instead of one after another --
+    # keeps the wait roughly equal to the slowest single query instead of
+    # their sum.
+    results_by_query = {}
+    with ThreadPoolExecutor(max_workers=len(queries)) as pool:
+        future_to_query = {
+            pool.submit(_ddg_search, q, limit): q for q in queries
+        }
+        for future in as_completed(future_to_query):
+            q = future_to_query[future]
+            try:
+                results_by_query[q] = future.result()
+            except Exception:  # noqa: BLE001 - a single query failing shouldn't sink the rest
+                results_by_query[q] = []
 
     merged = []
     seen_keys = set()
-    for query in (curated_query, open_query):
-        for item in _ddg_search(query, limit):
-            domain = urlparse(item["url"]).netloc.lower()
-            key = (domain, item["title"].lower())
-            if key in seen_keys or "arkanestate.com" in domain:
+    for query in queries:
+        for item in results_by_query.get(query, []):
+            parsed = urlparse(item["url"])
+            domain = parsed.netloc.lower()
+            if "arkanestate.com" in domain:
+                continue
+            # Dedupe by the URL itself (ignoring query string/fragment and a
+            # trailing slash) -- the same listing can turn up from more than
+            # one of the three queries above, and a URL match is a much more
+            # reliable "same listing" signal than title text, which can be a
+            # generic phrase repeated across many different listings on the
+            # same site.
+            key = (domain, parsed.path.rstrip("/"))
+            if key in seen_keys:
                 continue
             seen_keys.add(key)
             item["domain"] = domain
@@ -195,8 +251,8 @@ def search_market(area, transaction_type="sale", property_type=None, limit=8):
             break
 
     return {
-        "source": "Lebanese market (all agencies, brokers & portals)",
-        "queries": [curated_query, open_query],
+        "source": "Lebanese market (OLX, other portals, and the open web)",
+        "queries": queries,
         "results": merged,
     }
 
@@ -204,20 +260,33 @@ def search_market(area, transaction_type="sale", property_type=None, limit=8):
 def search_properties(area, transaction_type="sale", property_type=None,
                        min_price=None, max_price=None, bedrooms=None,
                        include_public_sources=True):
-    """Tool entry point called by the Claude agent.
+    """Tool entry point called by the Gemini agent.
 
     Arkan Estate is always checked first and, when it has matches, they
     should be presented first (that's the priority inventory). By default
-    this ALSO searches the wider Lebanese market -- every agency, broker,
-    and portal reachable via search -- so coverage is comprehensive, not
-    limited to a fixed shortlist. Pass include_public_sources=False to
-    check Arkan only.
+    this ALSO searches the wider Lebanese market -- OLX, the other curated
+    portals, and the open web -- so coverage is comprehensive, not limited
+    to a fixed shortlist. Pass include_public_sources=False to check Arkan
+    only.
+
+    Arkan's scrape and the market search run concurrently (not one after
+    the other), so asking for both doesn't roughly double the wait.
     """
-    arkan = search_arkan(area, transaction_type, property_type, min_price,
-                         max_price, bedrooms)
-    output = {"arkan_estate": arkan}
-    if include_public_sources:
-        output["lebanon_market"] = search_market(area, transaction_type, property_type)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        arkan_future = pool.submit(
+            search_arkan, area, transaction_type, property_type,
+            min_price, max_price, bedrooms,
+        )
+        market_future = None
+        if include_public_sources:
+            market_future = pool.submit(
+                search_market, area, transaction_type, property_type,
+            )
+
+        output = {"arkan_estate": arkan_future.result()}
+        if market_future is not None:
+            output["lebanon_market"] = market_future.result()
+
     return output
 
 
