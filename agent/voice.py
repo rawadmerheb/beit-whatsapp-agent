@@ -11,8 +11,9 @@ text-to-speech (outgoing voice replies).
   including native Lebanese Arabic voices (ar-LB-*).
 - ffmpeg (already required on the host) handles audio format conversion:
   WhatsApp voice notes arrive as audio/ogg (opus) and need to become WAV
-  for Whisper; outgoing replies are converted to ogg/opus so WhatsApp
-  renders them as a native-looking playable voice note.
+  for Whisper; outgoing WhatsApp replies are converted to ogg/opus so
+  WhatsApp renders them as a native-looking playable voice note; browser
+  chat replies stay as plain .mp3, which every browser plays natively.
 """
 
 import os
@@ -89,3 +90,16 @@ async def synthesize(text, out_dir):
     )
     os.remove(mp3_path)
     return ogg_path
+
+
+async def synthesize_mp3(text, out_dir):
+    """Same idea as synthesize(), but returns the .mp3 directly instead of
+    converting to .ogg/opus. Used for the browser chat's voice replies --
+    mp3 plays natively in every major browser (unlike ogg/opus, which
+    Safari doesn't reliably support), so no conversion step is needed."""
+    voice = pick_voice(text)
+    stem = uuid.uuid4().hex
+    mp3_path = os.path.join(out_dir, f"{stem}.mp3")
+    communicate = edge_tts.Communicate(text, voice)
+    await communicate.save(mp3_path)
+    return mp3_path
