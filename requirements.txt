@@ -1,6 +1,6 @@
 flask==3.0.3
 twilio==9.3.7
-anthropic==0.40.0
+google-genai==2.19.0
 faster-whisper==1.0.3
 edge-tts==6.1.19
 beautifulsoup4==4.12.3
