@@ -134,10 +134,18 @@ def ask_agent(user_text, history=None, max_tool_rounds=4):
                 contents,
             )
 
+        # Gemini 3.x models require each FunctionResponse to echo back the
+        # matching FunctionCall's `id` so the model can correlate calls and
+        # responses (older models didn't need this). The SDK's
+        # Part.from_function_response() convenience helper doesn't expose an
+        # `id` parameter, so build the Part manually here instead.
         response_parts = [
-            types.Part.from_function_response(
-                name=call.name,
-                response=_run_tool(call.name, dict(call.args or {})),
+            types.Part(
+                function_response=types.FunctionResponse(
+                    id=call.id,
+                    name=call.name,
+                    response=_run_tool(call.name, dict(call.args or {})),
+                )
             )
             for call in calls
         ]
