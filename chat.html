@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Beit — Lebanese Real Estate AI</title>
+<style>
+  :root {
+    --green: #1fae5f;
+    --green-dark: #148c48;
+    --bg: #eef2ef;
+    --panel: #ffffff;
+    --bubble-user: #d9fdd3;
+    --bubble-bot: #ffffff;
+    --text: #111b21;
+    --muted: #667781;
+    --border: #e4e7e5;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: var(--bg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    color: var(--text);
+  }
+  .app {
+    max-width: 560px;
+    margin: 0 auto;
+    height: 100dvh;
+    display: flex;
+    flex-direction: column;
+    background: var(--panel);
+    box-shadow: 0 0 40px rgba(0,0,0,0.08);
+  }
+  header {
+    background: var(--green);
+    color: white;
+    padding: 14px 18px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-shrink: 0;
+  }
+  header .avatar {
+    width: 40px; height: 40px;
+    background: rgba(255,255,255,0.2);
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 20px;
+  }
+  header .title { font-weight: 600; font-size: 16px; line-height: 1.3; }
+  header .subtitle { font-size: 12.5px; opacity: 0.9; }
+
+  .messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    background-image: radial-gradient(circle at 1px 1px, rgba(0,0,0,0.035) 1px, transparent 0);
+    background-size: 18px 18px;
+  }
+  .bubble-row { display: flex; }
+  .bubble-row.user { justify-content: flex-end; }
+  .bubble-row.bot { justify-content: flex-start; }
+  .bubble {
+    max-width: 78%;
+    padding: 9px 12px;
+    border-radius: 10px;
+    font-size: 14.5px;
+    line-height: 1.4;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    box-shadow: 0 1px 1px rgba(0,0,0,0.08);
+  }
+  .bubble-row.user .bubble { background: var(--bubble-user); border-top-right-radius: 2px; }
+  .bubble-row.bot .bubble { background: var(--bubble-bot); border-top-left-radius: 2px; }
+  .bubble audio { display: block; margin-top: 6px; width: 220px; max-width: 100%; height: 32px; }
+  .bubble .transcript-note { color: var(--muted); font-size: 12px; margin-top: 4px; font-style: italic; }
+
+  .typing { display: flex; gap: 4px; padding: 4px 2px; }
+  .typing span {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--muted);
+    animation: blink 1.2s infinite ease-in-out;
+  }
+  .typing span:nth-child(2) { animation-delay: 0.2s; }
+  .typing span:nth-child(3) { animation-delay: 0.4s; }
+  @keyframes blink { 0%, 80%, 100% { opacity: 0.25; } 40% { opacity: 1; } }
+
+  .composer {
+    flex-shrink: 0;
+    display: flex;
+    align-items: flex-end;
+    gap: 8px;
+    padding: 10px;
+    border-top: 1px solid var(--border);
+    background: var(--panel);
+  }
+  .composer textarea {
+    flex: 1;
+    resize: none;
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    padding: 10px 16px;
+    font-size: 14.5px;
+    font-family: inherit;
+    max-height: 100px;
+    outline: none;
+  }
+  .composer textarea:focus { border-color: var(--green); }
+  .icon-btn {
+    flex-shrink: 0;
+    width: 42px; height: 42px;
+    border-radius: 50%;
+    border: none;
+    background: var(--green);
+    color: white;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer;
+    font-size: 18px;
+    transition: background 0.15s, transform 0.1s;
+  }
+  .icon-btn:hover { background: var(--green-dark); }
+  .icon-btn:active { transform: scale(0.94); }
+  .icon-btn.mic.recording {
+    background: #e63946;
+    animation: pulse 1.1s infinite;
+  }
+  @keyframes pulse {
+    0% { box-shadow: 0 0 0 0 rgba(230,57,70,0.5); }
+    70% { box-shadow: 0 0 0 10px rgba(230,57,70,0); }
+    100% { box-shadow: 0 0 0 0 rgba(230,57,70,0); }
+  }
+  .hint {
+    text-align: center;
+    font-size: 11.5px;
+    color: var(--muted);
+    padding: 4px 0 8px;
+  }
+  .error-banner {
+    background: #fdecea;
+    color: #b3261e;
+    font-size: 13px;
+    padding: 8px 14px;
+    text-align: center;
+    display: none;
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="avatar">🏠</div>
+    <div>
+      <div class="title">Beit — بيت</div>
+      <div class="subtitle">Lebanese Real Estate AI Assistant</div>
+    </div>
+  </header>
+
+  <div class="error-banner" id="errorBanner"></div>
+
+  <div class="messages" id="messages">
+    <div class="bubble-row bot">
+      <div class="bubble" dir="auto">مرحبا! أنا بيت 🏠 — Ask me anything about buying, renting, or investing in Lebanese real estate. Type in Arabic, French, or English, or tap the mic to talk.</div>
+    </div>
+  </div>
+
+  <div class="composer">
+    <button class="icon-btn mic" id="micBtn" title="Record a voice message">🎤</button>
+    <textarea id="textInput" rows="1" placeholder="Type a message… (Arabic / Français / English)"></textarea>
+    <button class="icon-btn" id="sendBtn" title="Send">➤</button>
+  </div>
+  <div class="hint">Beit can search Arkan Estate and the wider Lebanese market, and explain property law &amp; investment questions.</div>
+</div>
+
+<script>
+const sessionId = (crypto.randomUUID ? crypto.randomUUID() : ('sess-' + Math.random().toString(36).slice(2)));
+const messagesEl = document.getElementById('messages');
+const textInput = document.getElementById('textInput');
+const sendBtn = document.getElementById('sendBtn');
+const micBtn = document.getElementById('micBtn');
+const errorBanner = document.getElementById('errorBanner');
+
+function showError(msg) {
+  errorBanner.textContent = msg;
+  errorBanner.style.display = 'block';
+  setTimeout(() => { errorBanner.style.display = 'none'; }, 6000);
+}
+
+function scrollToBottom() {
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+function appendMessage(role, text) {
+  const row = document.createElement('div');
+  row.className = 'bubble-row ' + role;
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+  bubble.setAttribute('dir', 'auto');
+  bubble.textContent = text;
+  row.appendChild(bubble);
+  messagesEl.appendChild(row);
+  scrollToBottom();
+  return bubble;
+}
+
+function appendTyping() {
+  const row = document.createElement('div');
+  row.className = 'bubble-row bot';
+  row.id = 'typingRow';
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+  bubble.innerHTML = '<div class="typing"><span></span><span></span><span></span></div>';
+  row.appendChild(bubble);
+  messagesEl.appendChild(row);
+  scrollToBottom();
+}
+
+function removeTyping() {
+  const row = document.getElementById('typingRow');
+  if (row) row.remove();
+}
+
+async function postToAgent(form) {
+  appendTyping();
+  try {
+    const res = await fetch('/api/chat', { method: 'POST', body: form });
+    const data = await res.json();
+    removeTyping();
+    if (!res.ok) {
+      showError(data.error || 'Something went wrong. Please try again.');
+      return;
+    }
+    const bubble = appendMessage('bot', data.reply);
+    if (data.audio_url) {
+      const audio = document.createElement('audio');
+      audio.controls = true;
+      audio.src = data.audio_url;
+      bubble.appendChild(audio);
+      audio.play().catch(() => {});
+    }
+  } catch (err) {
+    removeTyping();
+    showError('Could not reach the server. Check your connection and try again.');
+  }
+}
+
+function sendText() {
+  const text = textInput.value.trim();
+  if (!text) return;
+  appendMessage('user', text);
+  textInput.value = '';
+  autoGrow();
+  const form = new FormData();
+  form.append('session_id', sessionId);
+  form.append('message', text);
+  postToAgent(form);
+}
+
+function autoGrow() {
+  textInput.style.height = 'auto';
+  textInput.style.height = Math.min(textInput.scrollHeight, 100) + 'px';
+}
+
+textInput.addEventListener('input', autoGrow);
+textInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendText();
+  }
+});
+sendBtn.addEventListener('click', sendText);
+
+// --- Voice recording ---
+let mediaRecorder = null;
+let audioChunks = [];
+let recording = false;
+
+async function toggleRecording() {
+  if (!recording) {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      showError('Voice recording is not supported in this browser.');
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      audioChunks = [];
+      mediaRecorder = new MediaRecorder(stream);
+      mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) audioChunks.push(e.data); };
+      mediaRecorder.onstop = () => {
+        stream.getTracks().forEach((t) => t.stop());
+        const blob = new Blob(audioChunks, { type: 'audio/webm' });
+        if (blob.size < 500) {
+          showError('Recording was too short — try again.');
+          return;
+        }
+        appendMessage('user', '🎤 Voice message');
+        const form = new FormData();
+        form.append('session_id', sessionId);
+        form.append('audio', blob, 'recording.webm');
+        postToAgent(form);
+      };
+      mediaRecorder.start();
+      recording = true;
+      micBtn.classList.add('recording');
+    } catch (err) {
+      showError('Microphone permission was denied.');
+    }
+  } else {
+    mediaRecorder.stop();
+    recording = false;
+    micBtn.classList.remove('recording');
+  }
+}
+
+micBtn.addEventListener('click', toggleRecording);
+</script>
+</body>
+</html>
