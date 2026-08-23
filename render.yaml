@@ -15,7 +15,7 @@ services:
     plan: free
     healthCheckPath: /healthz
     envVars:
-      - key: ANTHROPIC_API_KEY
+      - key: GEMINI_API_KEY
         sync: false
       - key: TWILIO_ACCOUNT_SID
         sync: false
@@ -23,5 +23,5 @@ services:
         sync: false
       - key: WHISPER_MODEL_SIZE
         value: base
-      - key: ANTHROPIC_MODEL
-        value: claude-sonnet-5
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
