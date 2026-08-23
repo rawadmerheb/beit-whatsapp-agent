@@ -1,75 +1,96 @@
 # -*- coding: utf-8 -*-
 """
-Wraps the Anthropic Messages API with tool use (function calling) so Claude
-can call `search_properties` when it needs listings.
+Wraps the Google Gemini API with tool use (function calling) so Beit can
+call `search_properties` when it needs listings.
+
+Note on the filename: this file is still called `claude_client.py` for
+historical reasons (the project started on Anthropic's Claude API), but it
+now talks to Google's Gemini API instead -- Gemini's free tier needs no
+credit card, unlike Anthropic's API, which was the whole reason for this
+swap. Nothing else in the project had to change: `ask_agent()` below has
+the exact same name and signature as before, so `app.py`'s
+`from agent.claude_client import ask_agent` still works untouched.
+
+Get a free key at https://aistudio.google.com/apikey (no billing needed)
+and set it as GEMINI_API_KEY.
 """
 
-import json
 import os
 
-import anthropic
+from google import genai
+from google.genai import types
 
 from .property_search import search_properties
 from .system_prompt import SYSTEM_PROMPT
 
-client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from the environment
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
-# claude-sonnet-5: good speed/cost balance for a chat agent. Swap to
-# claude-haiku-4-5-20251001 for lower cost, or claude-opus-5 for the most
-# capable (slower/pricier) answers. See:
-# https://platform.claude.com/docs/en/about-claude/models/overview
-MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5")
+# gemini-2.5-flash: fast, capable, and on Google's free tier (no credit
+# card needed). See https://ai.google.dev/gemini-api/docs/models
+MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-TOOLS = [
-    {
-        "name": "search_properties",
-        "description": (
-            "Search for real estate listings across the whole Lebanese "
-            "market: Arkan Estate's own listings (the priority source -- "
-            "surface these first when present) plus the rest of the "
-            "market -- other agencies, brokers, and portals (OLX/Dubizzle "
-            "Lebanon, realestate.com.lb, Byootna, and an open web search "
-            "for anything else indexed). include_public_sources defaults "
-            "to true so both are checked in one call; set it false only "
-            "to check Arkan alone."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "area": {
-                    "type": "string",
-                    "description": "Area/neighborhood/city/region in Lebanon, e.g. 'Achrafieh', 'Batroun'.",
-                },
-                "transaction_type": {
-                    "type": "string",
-                    "enum": ["sale", "rent"],
-                },
-                "property_type": {
-                    "type": "string",
-                    "description": "e.g. apartment, villa, studio, office, land, duplex.",
-                },
-                "min_price": {"type": "number"},
-                "max_price": {"type": "number"},
-                "bedrooms": {"type": "integer"},
-                "include_public_sources": {
-                    "type": "boolean",
-                    "description": "Also search public Lebanese portals beyond Arkan Estate.",
-                },
+SEARCH_PROPERTIES_FN = types.FunctionDeclaration(
+    name="search_properties",
+    description=(
+        "Search for real estate listings across the whole Lebanese "
+        "market: Arkan Estate's own listings (the priority source -- "
+        "surface these first when present) plus the rest of the "
+        "market -- other agencies, brokers, and portals (OLX/Dubizzle "
+        "Lebanon, realestate.com.lb, Byootna, and an open web search "
+        "for anything else indexed). include_public_sources defaults "
+        "to true so both are checked in one call; set it false only "
+        "to check Arkan alone."
+    ),
+    parameters_json_schema={
+        "type": "object",
+        "properties": {
+            "area": {
+                "type": "string",
+                "description": "Area/neighborhood/city/region in Lebanon, e.g. 'Achrafieh', 'Batroun'.",
             },
-            "required": ["area"],
+            "transaction_type": {
+                "type": "string",
+                "enum": ["sale", "rent"],
+            },
+            "property_type": {
+                "type": "string",
+                "description": "e.g. apartment, villa, studio, office, land, duplex.",
+            },
+            "min_price": {"type": "number"},
+            "max_price": {"type": "number"},
+            "bedrooms": {"type": "integer"},
+            "include_public_sources": {
+                "type": "boolean",
+                "description": "Also search public Lebanese portals beyond Arkan Estate.",
+            },
         },
-    }
-]
+        "required": ["area"],
+    },
+)
+
+TOOLS = [types.Tool(function_declarations=[SEARCH_PROPERTIES_FN])]
 
 TOOL_IMPLS = {"search_properties": search_properties}
 
+GENERATION_CONFIG = types.GenerateContentConfig(
+    system_instruction=SYSTEM_PROMPT,
+    tools=TOOLS,
+    max_output_tokens=2048,
+    # Keep replies snappy for a chat agent rather than spending a chunk of
+    # the token budget on hidden "thinking" -- note some Gemini versions
+    # still reserve a little thinking budget when tools are attached even
+    # with this set to 0, hence the generous max_output_tokens above as a
+    # safety margin against truncated/empty replies.
+    thinking_config=types.ThinkingConfig(thinking_budget=0),
+)
 
-def _run_tool(block):
-    fn = TOOL_IMPLS.get(block.name)
+
+def _run_tool(name, args):
+    fn = TOOL_IMPLS.get(name)
     if fn is None:
-        return {"error": f"unknown tool '{block.name}'"}
+        return {"error": f"unknown tool '{name}'"}
     try:
-        return fn(**block.input)
+        return fn(**args)
     except Exception as e:  # noqa: BLE001 - surface any tool error to the model
         return {"error": str(e)}
 
@@ -83,39 +104,39 @@ def ask_agent(user_text, history=None, max_tool_rounds=4):
 
     Returns (final_reply_text, updated_history).
     """
-    messages = list(history or []) + [{"role": "user", "content": user_text}]
+    contents = list(history or [])
+    contents.append(
+        types.Content(role="user", parts=[types.Part.from_text(text=user_text)])
+    )
 
     for _ in range(max_tool_rounds):
-        response = client.messages.create(
+        response = client.models.generate_content(
             model=MODEL,
-            max_tokens=1024,
-            system=SYSTEM_PROMPT,
-            tools=TOOLS,
-            messages=messages,
+            contents=contents,
+            config=GENERATION_CONFIG,
         )
 
-        messages.append({"role": "assistant", "content": response.content})
+        contents.append(response.candidates[0].content)
 
-        if response.stop_reason != "tool_use":
-            final_text = "".join(
-                block.text for block in response.content if block.type == "text"
-            ).strip()
-            return final_text or "Sorry, I didn't catch that -- can you rephrase?", messages
+        calls = response.function_calls
+        if not calls:
+            final_text = (response.text or "").strip()
+            return (
+                final_text or "Sorry, I didn't catch that -- can you rephrase?",
+                contents,
+            )
 
-        tool_results = []
-        for block in response.content:
-            if block.type != "tool_use":    
-                continue
-            result = _run_tool(block)
-            tool_results.append({
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": json.dumps(result, ensure_ascii=False),
-            })
-        messages.append({"role": "user", "content": tool_results})
+        response_parts = [
+            types.Part.from_function_response(
+                name=call.name,
+                response=_run_tool(call.name, dict(call.args or {})),
+            )
+            for call in calls
+        ]
+        contents.append(types.Content(role="tool", parts=response_parts))
 
     return (
         "That search is taking more steps than expected -- can you narrow it down "
         "(one area + buy or rent)?",
-        messages,
+        contents,
     )
