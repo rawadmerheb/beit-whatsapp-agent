@@ -1,0 +1,9 @@
+flask==3.0.3
+twilio==9.3.7
+anthropic==0.40.0
+faster-whisper==1.0.3
+edge-tts==6.1.19
+beautifulsoup4==4.12.3
+requests==2.32.3
+python-dotenv==1.0.1
+gunicorn==23.0.0
