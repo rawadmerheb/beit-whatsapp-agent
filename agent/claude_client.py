@@ -25,9 +25,13 @@ from .system_prompt import SYSTEM_PROMPT
 
 client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
-# gemini-2.5-flash: fast, capable, and on Google's free tier (no credit
-# card needed). See https://ai.google.dev/gemini-api/docs/models
-MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+# gemini-3.6-flash: fast, capable, and on Google's free tier (no credit
+# card needed). See https://ai.google.dev/gemini-api/docs/models -- Google
+# periodically retires older free-tier models (gemini-2.5-flash was retired
+# for new users in 2026), so if this ever starts returning a 404 "model no
+# longer available" error, check that page for the current model name and
+# update this default (and the GEMINI_MODEL env var, if you've set one).
+MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 
 SEARCH_PROPERTIES_FN = types.FunctionDeclaration(
     name="search_properties",
@@ -77,11 +81,15 @@ GENERATION_CONFIG = types.GenerateContentConfig(
     tools=TOOLS,
     max_output_tokens=2048,
     # Keep replies snappy for a chat agent rather than spending a chunk of
-    # the token budget on hidden "thinking" -- note some Gemini versions
-    # still reserve a little thinking budget when tools are attached even
-    # with this set to 0, hence the generous max_output_tokens above as a
-    # safety margin against truncated/empty replies.
-    thinking_config=types.ThinkingConfig(thinking_budget=0),
+    # the token budget on hidden "thinking". Gemini 3.x models (this
+    # project uses gemini-3.6-flash) replaced the older numeric
+    # thinking_budget field with a thinking_level enum
+    # ("minimal"/"low"/"medium"/"high") -- passing the old thinking_budget
+    # field to a 3.x model is rejected outright with a 400 INVALID_ARGUMENT
+    # error, so make sure this stays thinking_level, not thinking_budget, if
+    # you ever touch this again. "minimal" is the closest equivalent to the
+    # old thinking_budget=0 (least hidden reasoning, fastest replies).
+    thinking_config=types.ThinkingConfig(thinking_level="minimal"),
 )
 
 
