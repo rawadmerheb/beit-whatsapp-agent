@@ -129,6 +129,14 @@ Real Estate, JSK Real Estate, Trust Lebanon Agency, Century 21 Lebanon,
 DuckDuckGo query treatment as the original four, and (since that's already
 generalized -- see the bedroom-count section above) the same
 detail-page bedroom/price confirmation as everything else DDG turns up.
+Expanded again 2026-08-27 after the user flagged that known premium
+brokers (Ray White specifically) were missing and results felt thin:
+added Ray White International Lebanon (raywhite.com.lb) plus a
+researched batch of other well-known, verified-active Lebanese brokers
+(Phoenicia Property, RAMCO Real Estate Advisers, AtaBuild, PBM Real
+Estate) -- each one's homepage was actually fetched and confirmed to have
+real individual listing detail pages (not just a corporate/info page)
+before being added, same bar as the original batch.
 
 If you ever want genuine Google-branded results badly enough to accept a
 paid API down the line, see README "Optional: real Google search results"
@@ -455,6 +463,22 @@ OTHER_KNOWN_PORTALS = [
     "century21.com.lb",
     "3akarat.net",
     "blusky-properties.com",
+    # Ray White International Lebanon -- confirmed real domain
+    # (raywhite.com.lb) 2026-08-27, added per the user naming it
+    # specifically as a premium broker missing from results.
+    "raywhite.com.lb",
+    # Batch added 2026-08-27 per the user's "premium brokers" ask -- each
+    # one confirmed (via a real fetch of its homepage, not just a search
+    # result) to be an active site with individual property listing pages,
+    # not just a corporate/info page with nothing to actually scrape:
+    "phoeniciaproperty.com",   # Beirut-focused, individual listing pages
+                                # confirmed (e.g. Property-R1240.html)
+    "ramcolb.com",             # RAMCO Real Estate Advisers, Beirut, est.
+                                # 1973 -- "Featured Properties" + /listings
+    "atabuild.com",            # self-described luxury/high-end Lebanese
+                                # real estate agency, confirmed listing pages
+    "pbm-leb.com",             # Lebanon brokerage since 2007, confirmed
+                                # individual /property/<id> listing pages
 ]
 
 # Per-request timeout for Arkan and the DuckDuckGo queries. Kept modest
