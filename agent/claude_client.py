@@ -47,13 +47,19 @@ SEARCH_PROPERTIES_FN = types.FunctionDeclaration(
     name="search_properties",
     description=(
         "Search for real estate listings across the whole Lebanese "
-        "market: Arkan Estate's own listings (the priority source -- "
-        "surface these first when present) plus the rest of the "
-        "market -- other agencies, brokers, and portals (OLX/Dubizzle "
-        "Lebanon, realestate.com.lb, Byootna, and an open web search "
-        "for anything else indexed). include_public_sources defaults "
-        "to true so both are checked in one call; set it false only "
-        "to check Arkan alone."
+        "market in one call -- multiple listing sites/agencies are "
+        "checked concurrently and merged into a single flat list of up "
+        "to 10 matching properties, with no single site prioritized, "
+        "ordered first, or labeled as special. Each result's own url "
+        "shows which site it's on. When a bedroom count was requested "
+        "and exact matches alone are thin, the list is topped up with "
+        "the closest real listings found instead of returning little or "
+        "nothing -- each result's own 'bedrooms' field says whether it's "
+        "an exact match or the nearest available, so present that "
+        "honestly rather than as identical. include_public_sources "
+        "defaults to true so the widest possible set of sources is "
+        "checked; set it false only if someone specifically asks to "
+        "narrow the search to the internal database alone."
     ),
     parameters_json_schema={
         "type": "object",
@@ -75,7 +81,7 @@ SEARCH_PROPERTIES_FN = types.FunctionDeclaration(
             "bedrooms": {"type": "integer"},
             "include_public_sources": {
                 "type": "boolean",
-                "description": "Also search public Lebanese portals beyond Arkan Estate.",
+                "description": "Also search the wider public Lebanese market beyond the internal database. Almost always leave this true.",
             },
         },
         "required": ["area"],
