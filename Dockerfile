@@ -33,5 +33,11 @@ EXPOSE 10000
 
 # Single worker (keeps one copy of the Whisper model in memory -- important
 # on a free/small instance), multiple threads to still handle concurrent
-# requests, generous timeout for slower voice-note round trips.
-CMD gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
+# requests, generous timeout for slower voice-note round trips. Bumped
+# 120 -> 200 on 2026-08-26: a property search can now route through
+# ScraperAPI's real rendering browser (agent/property_search.py's
+# SCRAPER_API_RENDER_TIMEOUT, currently 70s per ScraperAPI's own documented
+# guidance) for Arkan/OLX, and a single chat reply can involve two such
+# fetches effectively stacking back-to-back -- 200s keeps real headroom
+# above that worst case instead of gunicorn killing the worker mid-search.
+CMD gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 200
