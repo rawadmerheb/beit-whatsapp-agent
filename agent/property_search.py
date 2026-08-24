@@ -306,6 +306,35 @@ reply can involve two render fetches effectively stacking back-to-back
 (the initial archive-page fetch, then a detail-page fetch to confirm
 bedroom count) -- see BEDROOM_DETAIL_FETCH_CAP, also tightened to 8 so
 that second stage can't stack into two sequential batches worst-case.
+
+SECOND REAL TEST (2026-08-27): TWO MORE CONCRETE FINDINGS FROM LOGS,
+STILL NOT A REASON TO DOUBT THE APPROACH
+---------------------------------------------------------------------------
+After the 70s timeout fix above, a fresh test still failed end to end.
+Render's logs (searched for "Serper" and "ScraperAPI" right after a live
+test) showed two distinct, unrelated problems:
+  - Serper: the very first log line still showed SERPER_API_KEY set to
+    literal Dockerfile text ("# Docker build so ffmpeg...") -- the same
+    kind of copy/paste mix-up as agent/property_search.py getting the
+    Dockerfile's content earlier, just landing in an environment variable
+    box this time instead of a file. A later test (after presumably
+    re-pasting the key) instead got a 403 Forbidden straight back from
+    google.serper.dev -- a real response from Serper's own server, not a
+    malformed-request error like before, meaning whatever value is
+    currently in SERPER_API_KEY still isn't a key Serper accepts. This is
+    a configuration problem in Render's Environment tab, not a code bug --
+    nothing here can fix a wrong value sitting in that box.
+  - ScraperAPI: every single Arkan/OLX fetch got a 500 Internal Server
+    Error back from api.scraperapi.com itself (not the target site) while
+    render=true and premium=true were both set. ScraperAPI's own status-
+    code docs list only one documented cause for a 500: "Extraction
+    failed." Their premium-proxy-pools doc page separately says premium
+    pools are "available to all paid users" -- suggesting a free trial
+    might not qualify as "paid" for that specific feature, which would
+    explain every request failing the same way instead of just some.
+    premium=true has been removed below (render=true alone stays) to
+    isolate this; see _fetch()'s comment for the reasoning and what to
+    watch for next.
 """
 
 import logging
@@ -692,14 +721,22 @@ def _fetch(url, timeout=REQUEST_TIMEOUT, retries=1, render=False):
         params = {"api_key": SCRAPER_API_KEY, "url": url}
         if render:
             params["render"] = "true"
-            # premium=true: real residential proxies, not just a rendering
-            # browser -- Arkan/OLX (the only render=True callers) are
-            # confirmed to actively challenge/block plain requests (see
-            # module docstring), so it's worth the extra credits on
-            # exactly these two. NOT ultra_premium: that one's paid-plan
-            # only per ScraperAPI's own docs, so it would silently fail
-            # during a free trial.
-            params["premium"] = "true"
+            # premium=true REMOVED (see module docstring's next dated
+            # section) -- every single Arkan/OLX fetch came back as a 500
+            # "Extraction failed" straight from ScraperAPI's own server
+            # while this was set, confirmed directly from Render's logs.
+            # ScraperAPI's premium-proxy docs page says premium pools are
+            # "available to all paid users" -- a free trial may not count
+            # as "paid" even though it needs no card, which would explain a
+            # blanket failure on every request rather than just some. Only
+            # render=True (a real rendering browser, no special proxy pool)
+            # is requested now, to isolate whether that alone clears
+            # Arkan's JS reload-and-wait check and OLX's client-side
+            # rendering without the premium add-on. If Render's logs still
+            # show real listings failing after this, premium proxies (i.e.
+            # upgrading past the trial) may be the next thing to try --
+            # but don't re-add premium=true speculatively before that's
+            # actually confirmed necessary.
             timeout = max(timeout, SCRAPER_API_RENDER_TIMEOUT)
         request_kwargs = {"params": params}
     else:
