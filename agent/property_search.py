@@ -199,6 +199,34 @@ through a paid residential/rotating-IP proxy service (several exist
 specifically for this), not another tweak to this file. Worth knowing
 going in, so it isn't a surprise.
 
+FOLLOW-UP, SAME DAY: A "SUCCESSFUL" FETCH THAT'S ACTUALLY A BOT CHECK
+---------------------------------------------------------------------------
+After the fix above went live, the very next real test ("3 bedrooms in
+Jbeil") still came back with the generic "didn't find anything" reply --
+but Render's logs showed ZERO lines about OLX at all, success or failure.
+That's the tell: it means _fetch() got an HTTP 200 back from OLX (nothing
+"failed" in the eyes of requests.raise_for_status(), so nothing got
+logged), yet _parse_olx_cards() still pulled out 0 listings from whatever
+that 200 response actually contained. A manual check of the identical page
+moments before had shown it full of real listings -- so the most likely
+explanation is that OLX served a "prove you're not a robot" interstitial
+page instead of the real one, which is itself a normal HTTP 200 response,
+not an error status -- completely invisible to the previous round of
+logging, which only watched for outright request failures.
+
+Fixed by no longer trusting "got a 200" as "got the real page":
+_looks_like_bot_challenge() checks the fetched text itself for common
+bot-check phrasing (Cloudflare's challenge page, a generic "prove you're
+human" wall, etc.) -- when it matches, that fetch is now treated as NOT
+reached (same as a real network failure) instead of quietly producing
+"0 listings, nothing to log". And for the still-possible case where a
+fetch looks completely legitimate but still yields 0 parsed listings
+(a real, if less likely, sign that this code's own parsing selectors no
+longer match the site's current markup), the first ~300 characters of
+whatever was actually fetched now get logged too -- so the next time this
+happens, the logs show, in plain text, exactly what the server sent back,
+rather than requiring yet another guess.
+
 DDG RESULTS THAT LAND ON A SEARCH/CATEGORY PAGE, NOT AN ACTUAL LISTING
 (fixed 2026-08-25)
 ---------------------------------------------------------------------------
@@ -487,6 +515,37 @@ def _parse_arkan_cards(html, transaction_type, property_type,
     return results
 
 
+# Phrases that show up in a bot-check/verification interstitial page
+# (Cloudflare's challenge page, a generic "prove you're human" wall, etc.)
+# rather than the real page. These almost always come back as a normal
+# HTTP 200 -- _fetch()'s error handling never sees anything wrong, since
+# nothing actually "failed" from an HTTP-status point of view -- which is
+# exactly how a real production bug hid from every log line until this was
+# added: a technically-successful fetch that silently contains zero real
+# listings, logged nowhere, indistinguishable from "this site really has
+# nothing" without literally reading what came back. Added 2026-08-25 after
+# a live OLX search test parsed 0 listings with zero errors of any kind
+# logged, while a manual check of the exact same page moments earlier
+# (via a different fetch path) showed it full of real listings.
+BOT_CHALLENGE_MARKERS = (
+    "captcha", "checking your browser", "cf-browser-verification",
+    "cf-chl", "access denied", "are you a human", "just a moment",
+    "enable javascript and cookies", "unusual traffic", "verify you are human",
+    "attention required", "please verify you are a human",
+    "pardon our interruption", "request unsuccessful",
+)
+
+
+def _looks_like_bot_challenge(html):
+    """Cheap heuristic, not a guarantee: does this fetched page look like a
+    bot-check/verification wall rather than the real content? Not
+    exhaustive, but catches the common Cloudflare/anti-bot phrasing."""
+    if not html:
+        return False
+    lower = html.lower()
+    return any(marker in lower for marker in BOT_CHALLENGE_MARKERS)
+
+
 def _fetch(url, timeout=REQUEST_TIMEOUT, retries=1):
     """GETs a URL and returns its HTML text, or None on failure.
 
@@ -510,7 +569,7 @@ def _fetch(url, timeout=REQUEST_TIMEOUT, retries=1):
             resp.raise_for_status()
             return resp.text
         except requests.HTTPError as e:
-            logger.info("Fetch got an HTTP error for %s: %s", url, e)
+            logger.warning("Fetch got an HTTP error for %s: %s", url, e)
             return None
         except requests.RequestException as e:
             if attempt + 1 < attempts:
@@ -602,14 +661,27 @@ def search_arkan(area, transaction_type="sale", property_type=None,
         pages = [location_url, location_url.rstrip("/") + "/page/2/"]
         with ThreadPoolExecutor(max_workers=len(pages)) as pool:
             htmls = list(pool.map(_fetch, pages))
-        for html in htmls:
+        for page_url, html in zip(pages, htmls):
             if not html:
                 continue
+            if _looks_like_bot_challenge(html):
+                logger.warning(
+                    "Arkan: got a response for %s but it looks like a bot "
+                    "check/verification page, not real listings. First 300 "
+                    "chars: %r", page_url, html[:300],
+                )
+                continue
             fetched_any = True
-            for item in _parse_arkan_cards(
+            page_items = _parse_arkan_cards(
                 html, transaction_type, property_type,
                 min_price, max_price, limit * 3,
-            ):
+            )
+            if not page_items:
+                logger.warning(
+                    "Arkan: fetched %s successfully but parsed 0 listings "
+                    "from it. First 300 chars: %r", page_url, html[:300],
+                )
+            for item in page_items:
                 if item["url"] in seen_urls:
                     continue
                 seen_urls.add(item["url"])
@@ -618,12 +690,25 @@ def search_arkan(area, transaction_type="sale", property_type=None,
     if not candidates:
         fallback_url = f"{ARKAN_BASE}/?s={area}"
         html = _fetch(fallback_url)
+        if html and _looks_like_bot_challenge(html):
+            logger.warning(
+                "Arkan: got a response for %s but it looks like a bot "
+                "check/verification page, not real listings. First 300 "
+                "chars: %r", fallback_url, html[:300],
+            )
+            html = None
         if html:
             fetched_any = True
-            for item in _parse_arkan_cards(
+            fallback_items = _parse_arkan_cards(
                 html, transaction_type, property_type,
                 min_price, max_price, limit * 3,
-            ):
+            )
+            if not fallback_items:
+                logger.warning(
+                    "Arkan: fetched %s successfully but parsed 0 listings "
+                    "from it. First 300 chars: %r", fallback_url, html[:300],
+                )
+            for item in fallback_items:
                 if item["url"] in seen_urls:
                     continue
                 seen_urls.add(item["url"])
@@ -753,7 +838,20 @@ def _scrape_olx_cards(url, property_type, limit):
     if not html:
         logger.warning("OLX: could not reach %s", url)
         return [], False
-    return _parse_olx_cards(html, property_type, limit), True
+    if _looks_like_bot_challenge(html):
+        logger.warning(
+            "OLX: got a response for %s but it looks like a bot "
+            "check/verification page, not real listings. First 300 "
+            "chars: %r", url, html[:300],
+        )
+        return [], False
+    results = _parse_olx_cards(html, property_type, limit)
+    if not results:
+        logger.warning(
+            "OLX: fetched %s successfully but parsed 0 listings from it. "
+            "First 300 chars: %r", url, html[:300],
+        )
+    return results, True
 
 
 NON_LISTING_PATH_MARKERS = (
@@ -811,7 +909,15 @@ def _ddg_search(query, limit):
         )
         resp.raise_for_status()
     except requests.RequestException as e:
-        logger.info("DuckDuckGo search failed for query %r: %s", query, e)
+        logger.warning("DuckDuckGo search failed for query %r: %s", query, e)
+        return [], False
+
+    if _looks_like_bot_challenge(resp.text):
+        logger.warning(
+            "DuckDuckGo: got a response for query %r but it looks like a "
+            "block/anomaly page, not real results. First 300 chars: %r",
+            query, resp.text[:300],
+        )
         return [], False
 
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -832,6 +938,12 @@ def _ddg_search(query, limit):
         if price is not None:
             item["price_usd"] = price
         out.append(item)
+    if not out:
+        logger.warning(
+            "DuckDuckGo: query %r got a normal-looking response but 0 "
+            "results were parsed from it. First 300 chars: %r",
+            query, resp.text[:300],
+        )
     return out, True
 
 
