@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Property search: Arkan Estate first (priority inventory), then the rest of
-the Lebanese market -- every agency, broker, and portal Claude's search can
-surface, not a fixed shortlist.
+Generic Lebanese real estate search: every listing site/agency this code
+can reach gets searched and merged into ONE flat pool of results. No single
+site is treated as a priority source, labeled specially, or shown first --
+that includes Arkan Estate, which is just one more site being scraped here,
+same as OLX or anything else. (See agent/system_prompt.py for the matching
+instruction: never name Arkan by name in a reply unless the client asks.)
 
 HOW ARKAN'S SITE ACTUALLY WORKS (confirmed 2026-08-24 against the live
 site -- this replaces an earlier, untested "best guess" version of this
@@ -23,22 +26,58 @@ Both archive pages list ALL of that location's properties mixed together
 (buy + rent + land), newest first, paginated (.../page/2/, etc. -- standard
 WordPress pagination). There's no confirmed URL parameter that also filters
 by buy vs. rent server-side, so this code fetches the location page(s) and
-filters buy/rent/property-type/bedrooms client-side by reading each card's
-own text (titles consistently say "for Sale" / "for Rent", rentals are
-priced ".../month"). Individual listing pages are at
+filters buy/rent/property-type/price client-side by reading each card's own
+text (titles consistently say "for Sale" / "for Rent", rentals are priced
+".../month"). Individual listing pages are at
 https://arkanestate.com/properties/<slug>/ -- confirmed via Google-indexed
 Arkan pages and the user's own screenshot.
 
-If an area doesn't match a known area/city slug (e.g. it's misspelled, or
-somewhere Arkan genuinely doesn't cover -- they have nothing indexed for
-Bekaa or South Lebanon at time of writing), this falls back to Arkan's own
-sitewide WordPress search (?s=<area>) as a last resort.
+BEDROOM COUNT NEEDS A SECOND LOOK, AND A REAL FALLBACK, NOT JUST "NOTHING"
+(confirmed 2026-08-24, updated 2026-08-24 after a second real bug report)
+---------------------------------------------------------------------------
+The user found real 3-bedroom Jbeil listings on Arkan (among a real batch
+of 34) that a teaser-card-only regex was reporting as "not found" -- Arkan's
+search-results card doesn't reliably spell out bedroom count in an easy,
+consistent way; it's often only stated properly in the full listing's own
+page/description. So: a card's own teaser text is used to confirm/reject a
+bedroom count for free when it's actually stated there, and a card with NO
+bedroom info at all gets its own individual listing page fetched to check
+the real description (capped at a modest number of pages, run concurrently,
+so this doesn't blow up response time). See _resolve_bedrooms() /
+_extract_bedroom_count().
 
-If Arkan reorganizes their site later and this stops matching, the fastest
-fix: open a location's page on arkanestate.com yourself (e.g.
-arkanestate.com/area/achrafieh/), view page source, and check whether
-listing links still contain "/properties/" -- if not, that selector in
-_parse_arkan_cards() needs updating.
+Second, related bug the user then hit: even with that fix, a strict
+"exactly N bedrooms or nothing" filter can leave a reply with almost no
+individual listings to show -- especially on OLX, whose own on-site keyword
+search (baking "3-bedroom" into the URL as a literal search term) misses
+any real listing that phrases it differently ("3 BR", "3 Bedrooms", a
+separate "Rooms" attribute never rendered as that literal phrase, etc.), so
+scraping that keyword-filtered URL directly often came back with nothing to
+show even when the area genuinely has matching listings. The reply then
+degraded into "couldn't find anything, want to broaden the search?" with
+just a bare search-portal link -- which the user correctly called out as
+useless: the whole point of this bot is to hand over real listing links
+directly instead of making someone go search a portal themselves.
+
+Fixed by no longer keyword-filtering the page that actually gets scraped:
+OLX's plain (unfiltered) area/category page is scraped for real candidate
+listings, then bedroom count is confirmed exactly the same way as Arkan
+(card teaser first, individual listing page as a fallback) via the shared
+_resolve_bedrooms() helper. And _resolve_bedrooms() itself no longer
+discards non-matching candidates outright -- it now returns
+(matched, close_matches): confirmed exact matches, AND a second, real,
+still-linkable pool of the next-closest listings (a different confirmed
+bedroom count, or one whose count couldn't be confirmed even after
+checking its own page). search_properties() tops the results list up with
+close_matches (from either source) whenever confirmed exact matches alone
+don't fill out a full page, so a reply almost always has real listings to
+show. Every item keeps an honest "bedrooms" field whenever a count was
+ever confirmed, whether or not it matches what was asked, so a reply can
+say "this one's 2BR, closest to the 3BR you wanted" instead of either
+hiding the mismatch or showing nothing at all. OLX's own keyword-filtered
+search URL is still built and handed back as "olx_search_url" -- it's a
+perfectly good link for someone to keep browsing themselves, just not
+relied on as the only way individual listings get found.
 
 ON "ALL AGENCIES AND BROKERS IN LEBANON" (AND "GOOGLE")
 --------------------------------------------------------
@@ -49,14 +88,15 @@ Google closed its Custom Search JSON API to new sign-ups, and the paid
 proxies that front real Google results (Serper, SerpAPI, etc.) only offer a
 one-time free trial before they require a paid plan.
 
-OLX (olx.com.lb, Lebanon's biggest classifieds/property portal, explicitly
-requested) gets scraped DIRECTLY -- fetching OLX's own category page
-(confirmed URL scheme: olx.com.lb/properties/<category>/<area>/[q-<kw>/])
-and reading individual listing links straight off it (confirmed pattern:
-href containing "/ad/" and ending "-ID<code>.html"), instead of hoping a
-search engine happens to have indexed individual OLX listing pages -- it
-generally hasn't; OLX's own indexed pages are almost all category pages,
-not individual ads, confirmed by testing.
+OLX (olx.com.lb, Lebanon's biggest classifieds/property portal) gets
+scraped DIRECTLY -- fetching OLX's own category page (confirmed URL
+scheme: olx.com.lb/properties/<category>/<area>/) and reading individual
+listing links straight off it (confirmed pattern: href containing "/ad/"
+and ending "-ID<code>.html"), instead of hoping a search engine happens to
+have indexed individual OLX listing pages -- it generally hasn't; OLX's own
+indexed pages are almost all category pages, not individual ads, confirmed
+by testing. It's fine to name OLX specifically when presenting a result
+found there.
 
 For everything beyond OLX and Arkan -- the long tail of other agencies,
 brokers, and portals -- `search_market()` also runs two DuckDuckGo queries
@@ -167,6 +207,11 @@ REQUEST_TIMEOUT = 10
 # plain WordPress page -- give it a bit more rope before giving up, since
 # it's one of the two explicitly-requested sources.
 OLX_TIMEOUT = 14
+# Cap on how many "no bedroom info on the card" candidates get their own
+# individual page fetched to confirm bedroom count -- bounds worst-case
+# latency (these run concurrently, but still cost real time). Applied
+# separately per source (Arkan, OLX).
+BEDROOM_DETAIL_FETCH_CAP = 12
 
 
 def _slugify(text):
@@ -185,6 +230,25 @@ def _clean_price(text):
         return int(m.group(1).replace(",", ""))
     except ValueError:
         return None
+
+
+def _extract_bedroom_count(text):
+    """Looks for a bedroom count in free text, in whichever order it's
+    written ("3 Bedrooms", "Bedrooms: 3", "3 BR"). Returns None if no
+    bedroom count is mentioned at all -- that's a real, common case on a
+    compact search-card teaser, and callers should NOT treat "not found
+    here" as "this listing has no matching bedrooms" (see
+    _resolve_bedrooms)."""
+    if not text:
+        return None
+    lower = text.lower()
+    m = re.search(r"(\d+)\s*(?:bed\s?rooms?|br\b)", lower)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"bed\s?rooms?\s*[:\-]?\s*(\d+)", lower)
+    if m:
+        return int(m.group(1))
+    return None
 
 
 def _arkan_location_url(area):
@@ -234,7 +298,11 @@ def _dedupe_hrefs_prefer_text(anchors):
 
 
 def _parse_arkan_cards(html, transaction_type, property_type,
-                        min_price, max_price, bedrooms, limit):
+                        min_price, max_price, limit):
+    """Parses Arkan's location-archive card grid. Does NOT filter by
+    bedroom count here -- that's handled afterward in _resolve_bedrooms(),
+    since a card's teaser text often doesn't mention bedrooms at all even
+    when the listing itself has them (see module docstring)."""
     soup = BeautifulSoup(html, "html.parser")
     results = []
 
@@ -263,21 +331,13 @@ def _parse_arkan_cards(html, transaction_type, property_type,
             continue
         if max_price and price and price > max_price:
             continue
-        if bedrooms:
-            # Require an explicit, matching bedroom count when the user
-            # asked for a specific number -- a listing with no bedroom
-            # info at all (land, an office, a parsing gap) is more likely
-            # a false positive than a real match, so exclude it rather
-            # than including it just because we can't rule it out.
-            bd_match = re.search(r"(\d+)\s*(?:bed|br\b)", lower)
-            if not bd_match or int(bd_match.group(1)) != bedrooms:
-                continue
 
         results.append({
             "title": title,
             "url": href if href.startswith("http") else ARKAN_BASE + href,
             "price_usd": price,
             "snippet": text_block[:220],
+            "bedrooms_hint": _extract_bedroom_count(text_block),
         })
         if len(results) >= limit:
             break
@@ -294,17 +354,72 @@ def _fetch(url, timeout=REQUEST_TIMEOUT):
         return None
 
 
+def _resolve_bedrooms(candidates, bedrooms, cap=BEDROOM_DETAIL_FETCH_CAP):
+    """Confirms/rejects a requested bedroom count across a list of candidate
+    listings, returning (matched, close_matches) -- NEITHER list discards a
+    real listing outright.
+
+    `matched` are candidates confirmed (from the card's own teaser, or --
+    when the teaser says nothing -- from the listing's own detail page,
+    capped at `cap` concurrent fetches to bound latency) to have exactly
+    `bedrooms` bedrooms.
+
+    `close_matches` is everything else: a different confirmed bedroom
+    count, or a bedroom count that's still unknown even after checking the
+    detail page (the page didn't load, or genuinely doesn't state it
+    anywhere). Every item that ever gets a confirmed count keeps it in a
+    "bedrooms" field (regardless of which list it ends up in); an item
+    whose count never got confirmed simply has no "bedrooms" key.
+
+    Callers use `close_matches` to top a reply up with real, honestly
+    labeled listings when `matched` alone is too thin to be useful -- the
+    fix for a real bug where an exact-match-only filter (especially on
+    OLX, whose own keyword search misses listings that phrase bedroom
+    count differently) could leave a reply with nothing to show at all,
+    even though the area clearly has real listings close to what was
+    asked."""
+    matched = []
+    close_matches = []
+    ambiguous = []
+    for item in candidates:
+        hint = item.pop("bedrooms_hint", None)
+        if hint is None:
+            ambiguous.append(item)
+            continue
+        item["bedrooms"] = hint
+        (matched if hint == bedrooms else close_matches).append(item)
+
+    to_check = ambiguous[:cap]
+    close_matches.extend(ambiguous[cap:])
+    if to_check:
+        with ThreadPoolExecutor(max_workers=min(8, len(to_check))) as pool:
+            detail_htmls = list(pool.map(lambda it: _fetch(it["url"]), to_check))
+        for item, html in zip(to_check, detail_htmls):
+            confirmed = None
+            if html:
+                page_text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
+                confirmed = _extract_bedroom_count(page_text)
+            if confirmed is not None:
+                item["bedrooms"] = confirmed
+            (matched if confirmed == bedrooms else close_matches).append(item)
+
+    return matched, close_matches
+
+
 def search_arkan(area, transaction_type="sale", property_type=None,
                   min_price=None, max_price=None, bedrooms=None, limit=10):
     """Scrapes arkanestate.com's own location pages directly (see module
     docstring for the confirmed URL scheme). Tries the matched area/city
     page (plus its page 2, for more to filter from) first, then falls back
     to Arkan's own sitewide search if the area doesn't match a known page.
-    Always returns a working "url" -- even with zero scraped results, it's
-    a live, correctly-targeted link the user can open themselves.
+    When a bedroom count is requested, candidates are split into confirmed
+    "results" and a real, honestly-labeled "close_matches" fallback pool
+    (see _resolve_bedrooms) instead of silently discarding anything that
+    isn't an exact match. Always returns a working "url" -- even with zero
+    scraped results, it's a live, correctly-targeted link.
     """
     location_url = _arkan_location_url(area)
-    all_results = []
+    candidates = []
     seen_urls = set()
     fetched_any = False
 
@@ -318,33 +433,42 @@ def search_arkan(area, transaction_type="sale", property_type=None,
             fetched_any = True
             for item in _parse_arkan_cards(
                 html, transaction_type, property_type,
-                min_price, max_price, bedrooms, limit * 2,
+                min_price, max_price, limit * 3,
             ):
                 if item["url"] in seen_urls:
                     continue
                 seen_urls.add(item["url"])
-                all_results.append(item)
+                candidates.append(item)
 
-    if not all_results:
+    if not candidates:
         fallback_url = f"{ARKAN_BASE}/?s={area}"
         html = _fetch(fallback_url)
         if html:
             fetched_any = True
             for item in _parse_arkan_cards(
                 html, transaction_type, property_type,
-                min_price, max_price, bedrooms, limit,
+                min_price, max_price, limit * 3,
             ):
                 if item["url"] in seen_urls:
                     continue
                 seen_urls.add(item["url"])
-                all_results.append(item)
-        if not all_results:
+                candidates.append(item)
+        if not candidates:
             location_url = location_url or fallback_url
 
+    close_matches = []
+    if bedrooms:
+        candidates, close_matches = _resolve_bedrooms(candidates, bedrooms)
+    else:
+        for item in candidates:
+            hint = item.pop("bedrooms_hint", None)
+            if hint is not None:
+                item["bedrooms"] = hint
+
     output = {
-        "source": "Arkan Estate",
         "url": location_url or f"{ARKAN_BASE}/?s={area}",
-        "results": all_results[:limit],
+        "results": candidates[:limit],
+        "close_matches": close_matches[:limit],
     }
     if not fetched_any:
         output["error"] = "Could not reach Arkan Estate's site just now."
@@ -354,8 +478,12 @@ def search_arkan(area, transaction_type="sale", property_type=None,
 def _olx_search_url(area, transaction_type, property_type, bedrooms):
     """Builds OLX's own category/area/keyword search URL directly --
     confirmed URL scheme (2026-08-24): olx.com.lb/properties/<category>/
-    <area-slug>/[q-<keywords>/]. This is always a valid, live, correctly
-    filtered search page even before any scraping is attempted."""
+    <area-slug>/[q-<keywords>/]. Handed back as "olx_search_url" so
+    someone can keep browsing on OLX itself -- a genuinely useful, always-
+    live link, even though (see _olx_category_url below) it's no longer
+    the URL actually scraped for individual listings, since OLX's own
+    keyword search misses real listings that phrase bedroom count
+    differently than the literal keyword."""
     category = (
         "apartments-villas-for-rent" if transaction_type == "rent"
         else "apartments-villas-for-sale"
@@ -372,18 +500,30 @@ def _olx_search_url(area, transaction_type, property_type, bedrooms):
     return f"{OLX_BASE}/properties/{category}/{area_slug}/{q_segment}"
 
 
-def _scrape_olx_cards(url, limit):
-    """Scrapes OLX's own category page directly. Never raises -- returns
-    [] on any failure (timeout, block, markup change) so a slow/blocked
-    page degrades gracefully instead of breaking the whole reply. OLX's
-    pages are heavier than a plain WordPress page and occasionally slow or
-    anti-bot-guarded, so an empty result here doesn't necessarily mean no
-    listings exist -- that's exactly why `url` above is always handed back
-    to the user regardless."""
-    html = _fetch(url, timeout=OLX_TIMEOUT)
-    if not html:
-        return []
+def _olx_category_url(area, transaction_type):
+    """The plain (no keyword filter) OLX category+area page -- this is what
+    actually gets scraped for individual listing links. Kept separate from
+    _olx_search_url() (which bakes a bedroom-count keyword into the URL)
+    because OLX's own free-text search only matches a listing if it
+    happens to contain that literal phrase ("3-bedroom") -- many real
+    listings phrase it differently ("3 BR", "3 Bedrooms", a separate
+    "Rooms" attribute that never renders as that exact phrase, etc.) and
+    would be silently missed by a keyword-filtered fetch. Scraping the
+    plain, unfiltered page instead and confirming bedroom count the same
+    way Arkan's listings are confirmed (via _resolve_bedrooms) surfaces
+    real matches a keyword search alone would miss."""
+    category = (
+        "apartments-villas-for-rent" if transaction_type == "rent"
+        else "apartments-villas-for-sale"
+    )
+    area_slug = _slugify(area) or "lebanon"
+    return f"{OLX_BASE}/properties/{category}/{area_slug}/"
 
+
+def _parse_olx_cards(html, property_type, limit):
+    """Parses an OLX category page's card grid. Mirrors
+    _parse_arkan_cards(): does NOT filter by bedroom count here -- that's
+    handled afterward, the same way, by _resolve_bedrooms()."""
     soup = BeautifulSoup(html, "html.parser")
     results = []
     seen_urls = set()
@@ -402,23 +542,45 @@ def _scrape_olx_cards(url, limit):
 
         card = a.find_parent(["li", "article", "div"]) or a
         text_block = card.get_text(" ", strip=True)
+        lower = text_block.lower()
+        if property_type and property_type.lower() not in lower:
+            continue
 
         results.append({
             "title": title,
             "url": full_url,
             "price_usd": _clean_price(text_block),
             "snippet": text_block[:220],
+            "bedrooms_hint": _extract_bedroom_count(text_block),
         })
         if len(results) >= limit:
             break
     return results
 
 
+def _scrape_olx_cards(url, property_type, limit):
+    """Fetches and parses one OLX category page. Never raises -- returns []
+    on any failure (timeout, block, markup change) so a slow/blocked page
+    degrades gracefully instead of breaking the whole reply. OLX's pages
+    are heavier than a plain WordPress page and occasionally slow or
+    anti-bot-guarded, so an empty result here doesn't necessarily mean no
+    listings exist -- that's exactly why "olx_search_url" is always handed
+    back to the user regardless."""
+    html = _fetch(url, timeout=OLX_TIMEOUT)
+    if not html:
+        return []
+    return _parse_olx_cards(html, property_type, limit)
+
+
 def _ddg_search(query, limit):
     """One query against DuckDuckGo's no-JS HTML endpoint. Returns a list of
     {title, url, snippet} dicts, or an empty list on failure (never raises --
     a slow/blocked search engine should degrade gracefully, not break the
-    whole reply)."""
+    whole reply). Bedroom count is opportunistically read from the search
+    engine's own title/snippet text when it happens to be there (best
+    effort only -- unlike Arkan/OLX, there's no listing page of our own to
+    fall back and check, so a miss here just means an absent "bedrooms"
+    field, not an incorrect one)."""
     try:
         resp = requests.post(
             "https://html.duckduckgo.com/html/",
@@ -437,33 +599,42 @@ def _ddg_search(query, limit):
         snippet_tag = res.select_one(".result__snippet")
         if not link_tag or not link_tag.get("href"):
             continue
-        out.append({
-            "title": link_tag.get_text(strip=True),
-            "url": link_tag.get("href"),
-            "snippet": snippet_tag.get_text(strip=True) if snippet_tag else "",
-        })
+        title = link_tag.get_text(strip=True)
+        snippet = snippet_tag.get_text(strip=True) if snippet_tag else ""
+        item = {"title": title, "url": link_tag.get("href"), "snippet": snippet}
+        bedrooms_hint = _extract_bedroom_count(f"{title} {snippet}")
+        if bedrooms_hint is not None:
+            item["bedrooms"] = bedrooms_hint
+        out.append(item)
     return out
 
 
 def search_market(area, transaction_type="sale", property_type=None,
-                   bedrooms=None, limit=8):
-    """Search the rest of the Lebanese market beyond Arkan: OLX scraped
-    directly, the other known major portals, and an unrestricted search
-    with no site filter, so agencies/brokers not on the curated list still
-    surface too. All three run concurrently and are merged, deduped by
-    domain+path. Always includes "olx_search_url" -- a live, correctly
-    filtered OLX link -- even when nothing was scraped."""
+                   bedrooms=None, limit=10):
+    """Search the Lebanese market beyond Arkan: OLX scraped directly, the
+    other known major portals, and an unrestricted search with no site
+    filter, so agencies/brokers not on the curated list still surface too.
+    All three run concurrently and are merged, deduped by domain+path.
+    Always includes "olx_search_url" -- a live, correctly filtered OLX
+    link -- even when nothing was scraped. When a bedroom count is
+    requested, OLX candidates are confirmed/split into "results" and a
+    "close_matches" fallback pool the same way Arkan's are (see
+    _resolve_bedrooms + module docstring on why OLX's own keyword search
+    isn't relied on for this). (Arkan itself is searched separately by
+    search_arkan() and merged in by search_properties() -- this function
+    is everything else.)"""
     kind = "for sale" if transaction_type != "rent" else "for rent"
     ptype = f" {property_type}" if property_type else ""
 
-    olx_url = _olx_search_url(area, transaction_type, property_type, bedrooms)
+    olx_search_url = _olx_search_url(area, transaction_type, property_type, bedrooms)
+    olx_scrape_url = _olx_category_url(area, transaction_type)
     other_site_filter = " OR ".join(f"site:{d}" for d in OTHER_KNOWN_PORTALS)
     other_portals_query = f"{area}{ptype} {kind} Lebanon ({other_site_filter})"
     open_query = f"{area}{ptype} {kind} Lebanon real estate agency broker listing"
     ddg_queries = [other_portals_query, open_query]
 
     with ThreadPoolExecutor(max_workers=len(ddg_queries) + 1) as pool:
-        olx_future = pool.submit(_scrape_olx_cards, olx_url, limit)
+        olx_future = pool.submit(_scrape_olx_cards, olx_scrape_url, property_type, limit * 3)
         ddg_futures = {pool.submit(_ddg_search, q, limit): q for q in ddg_queries}
 
         try:
@@ -479,82 +650,150 @@ def search_market(area, transaction_type="sale", property_type=None,
             except Exception:  # noqa: BLE001
                 results_by_query[q] = []
 
+    olx_close = []
+    if bedrooms:
+        olx_results, olx_close = _resolve_bedrooms(olx_results, bedrooms)
+    else:
+        for item in olx_results:
+            hint = item.pop("bedrooms_hint", None)
+            if hint is not None:
+                item["bedrooms"] = hint
+
     merged = []
+    close_matches = []
     seen_keys = set()
 
-    # OLX's own direct scrape goes first -- it's the named priority public
-    # source, and unlike the DDG-routed queries below, these results come
-    # straight off OLX's page itself.
-    for item in olx_results:
+    def _dedupe_key(item):
         parsed = urlparse(item["url"])
         domain = parsed.netloc.lower()
-        key = (domain, parsed.path.rstrip("/"))
+        return domain, parsed.path.rstrip("/")
+
+    def _add(item, bucket):
+        key = _dedupe_key(item)
         if key in seen_keys:
-            continue
+            return
         seen_keys.add(key)
-        item["domain"] = domain
-        merged.append(item)
+        item["domain"] = key[0]
+        bucket.append(item)
+
+    for item in olx_results:
+        _add(item, merged)
 
     for query in ddg_queries:
+        if len(merged) >= limit:
+            break
         for item in results_by_query.get(query, []):
-            parsed = urlparse(item["url"])
-            domain = parsed.netloc.lower()
+            domain = urlparse(item["url"]).netloc.lower()
             if "arkanestate.com" in domain or "olx.com.lb" in domain:
                 continue
+            if len(merged) >= limit:
+                break
             # Dedupe by the URL itself (ignoring query string/fragment and a
             # trailing slash) -- the same listing can turn up more than
             # once, and a URL match is a more reliable "same listing"
             # signal than title text, which repeats across many listings.
-            key = (domain, parsed.path.rstrip("/"))
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-            item["domain"] = domain
-            merged.append(item)
-            if len(merged) >= limit:
-                break
-        if len(merged) >= limit:
-            break
+            _add(item, merged)
+
+    for item in olx_close:
+        _add(item, close_matches)
 
     return {
-        "source": "Lebanese market (OLX, other portals, and the open web)",
-        "olx_search_url": olx_url,
+        "olx_search_url": olx_search_url,
         "queries": ddg_queries,
         "results": merged[:limit],
+        "close_matches": close_matches[:limit],
     }
 
 
 def search_properties(area, transaction_type="sale", property_type=None,
                        min_price=None, max_price=None, bedrooms=None,
-                       include_public_sources=True):
-    """Tool entry point called by the Gemini agent.
+                       include_public_sources=True, limit=10):
+    """Tool entry point called by the Gemini agent. Searches the Lebanese
+    market as ONE generic pool: Arkan Estate's site and the wider market
+    (OLX, other portals, open web) all run concurrently and get merged
+    into a single flat "results" list -- interleaved, not ordered by
+    source, so no single site (including Arkan) is presented first or
+    labeled as a priority. Each result item's own "url" naturally reveals
+    which site it's on; nothing here names Arkan explicitly (see
+    agent/system_prompt.py for how results should be described in a reply).
 
-    Arkan Estate is always checked first and, when it has matches, they
-    should be presented first (that's the priority inventory). By default
-    this ALSO searches the wider Lebanese market -- OLX, the other curated
-    portals, and the open web -- so coverage is comprehensive, not limited
-    to a fixed shortlist. Pass include_public_sources=False to check Arkan
-    only.
+    When a bedroom count is requested and confirmed exact matches alone
+    don't fill out a full page of `limit` results, the list is topped up
+    with the closest real listings found instead (a different confirmed
+    bedroom count, or one that couldn't be confirmed) -- every item keeps
+    an honest "bedrooms" field whenever a count is known, so an approximate
+    match is never indistinguishable from an exact one. This is what makes
+    a reply show real listings directly far more often, instead of falling
+    back to "couldn't find anything" whenever an exact match is thin.
 
-    Arkan's scrape and the market search run concurrently (not one after
-    the other), so asking for both doesn't roughly double the wait.
+    Pass include_public_sources=False to search Arkan's site alone.
     """
     with ThreadPoolExecutor(max_workers=2) as pool:
         arkan_future = pool.submit(
             search_arkan, area, transaction_type, property_type,
-            min_price, max_price, bedrooms,
+            min_price, max_price, bedrooms, limit,
         )
         market_future = None
         if include_public_sources:
             market_future = pool.submit(
-                search_market, area, transaction_type, property_type, bedrooms,
+                search_market, area, transaction_type, property_type,
+                bedrooms, limit,
             )
 
-        output = {"arkan_estate": arkan_future.result()}
-        if market_future is not None:
-            output["lebanon_market"] = market_future.result()
+        arkan_out = arkan_future.result()
+        market_out = market_future.result() if market_future is not None else {
+            "results": [], "olx_search_url": None, "close_matches": [],
+        }
 
-    return output
+    seen_keys = set()
+
+    def _dedupe_key(item):
+        parsed = urlparse(item["url"])
+        domain = parsed.netloc.lower()
+        return domain, parsed.path.rstrip("/")
+
+    def _add(item, bucket):
+        key = _dedupe_key(item)
+        if key in seen_keys:
+            return False
+        seen_keys.add(key)
+        item.setdefault("domain", key[0])
+        bucket.append(item)
+        return True
+
+    # Interleave rather than concatenate -- concatenating would always put
+    # one source's results ahead of the other's, which is exactly the
+    # "priority source" framing this is meant to avoid.
+    arkan_results = arkan_out.get("results", [])
+    market_results = market_out.get("results", [])
+    merged = []
+    for i in range(max(len(arkan_results), len(market_results))):
+        if len(merged) >= limit:
+            break
+        if i < len(market_results):
+            _add(market_results[i], merged)
+        if i < len(arkan_results) and len(merged) < limit:
+            _add(arkan_results[i], merged)
+
+    # A bedroom count was requested but confirmed exact matches alone are
+    # thin -- top the list up with real, honestly-labeled close matches
+    # (see search_arkan/search_market/_resolve_bedrooms) rather than
+    # leaving the reply with little or nothing to actually show.
+    if bedrooms and len(merged) < limit:
+        arkan_close = arkan_out.get("close_matches", [])
+        market_close = market_out.get("close_matches", [])
+        for i in range(max(len(arkan_close), len(market_close))):
+            if len(merged) >= limit:
+                break
+            if i < len(market_close):
+                _add(market_close[i], merged)
+            if i < len(arkan_close) and len(merged) < limit:
+                _add(arkan_close[i], merged)
+
+    return {
+        "results": merged,
+        "olx_search_url": market_out.get("olx_search_url"),
+    }
 
 
 if __name__ == "__main__":
