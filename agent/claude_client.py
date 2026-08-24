@@ -63,7 +63,12 @@ SEARCH_PROPERTIES_FN = types.FunctionDeclaration(
         "as identical. include_public_sources defaults to true so the "
         "widest possible set of sources is checked; set it false only if "
         "someone specifically asks to narrow the search to the internal "
-        "database alone."
+        "database alone. Check the response's 'search_unavailable' field "
+        "before reacting to an empty 'results' list -- true means the "
+        "search couldn't reach any listing sites at all just now (a "
+        "temporary issue, say so honestly, never imply the area has no "
+        "properties), which is different from a completed search that "
+        "genuinely found nothing."
     ),
     parameters_json_schema={
         "type": "object",
