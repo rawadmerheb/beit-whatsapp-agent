@@ -78,6 +78,9 @@
   .bubble-row.bot .bubble { background: var(--bubble-bot); border-top-left-radius: 2px; }
   .bubble audio { display: block; margin-top: 6px; width: 220px; max-width: 100%; height: 32px; }
   .bubble .transcript-note { color: var(--muted); font-size: 12px; margin-top: 4px; font-style: italic; }
+  .bubble a { color: var(--green-dark); text-decoration: underline; word-break: break-word; }
+  .bubble a:visited { color: var(--green-dark); }
+  .bubble strong { font-weight: 600; }
 
   .typing { display: flex; gap: 4px; padding: 4px 2px; }
   .typing span {
@@ -193,13 +196,48 @@ function scrollToBottom() {
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
+// The bot's replies can contain markdown links (from search results, e.g.
+// "[Arkan: Jbeil listings](https://arkanestate.com/city/jbeil/)") and
+// **bold** text. The user's own messages never do, so only bot bubbles run
+// through this -- everything is HTML-escaped first, so this can't be used
+// to inject markup, it just turns that specific escaped syntax back into
+// real <a>/<strong> tags.
+function escapeHtml(str) {
+  return str.replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+}
+
+function formatBotText(text) {
+  let html = escapeHtml(text);
+  // Markdown links: [label](https://...)
+  html = html.replace(
+    /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
+    '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>'
+  );
+  // Bold: **text** or __text__
+  html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  html = html.replace(/__([^_]+)__/g, '<strong>$1</strong>');
+  // Any remaining bare URL (not already inside an href="..." we just
+  // added -- those are preceded by a quote, which this pattern excludes).
+  html = html.replace(
+    /(^|[^"'>])(https?:\/\/[^\s<]+)/g,
+    '$1<a href="$2" target="_blank" rel="noopener noreferrer">$2</a>'
+  );
+  return html;
+}
+
 function appendMessage(role, text) {
   const row = document.createElement('div');
   row.className = 'bubble-row ' + role;
   const bubble = document.createElement('div');
   bubble.className = 'bubble';
   bubble.setAttribute('dir', 'auto');
-  bubble.textContent = text;
+  if (role === 'bot') {
+    bubble.innerHTML = formatBotText(text);
+  } else {
+    bubble.textContent = text;
+  }
   row.appendChild(bubble);
   messagesEl.appendChild(row);
   scrollToBottom();
