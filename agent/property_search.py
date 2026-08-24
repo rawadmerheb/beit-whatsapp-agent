@@ -343,13 +343,79 @@ test) showed two distinct, unrelated problems:
     premium=true has been removed below (render=true alone stays) to
     isolate this; see _fetch()'s comment for the reasoning and what to
     watch for next.
+
+FOUR MORE REAL ISSUES, ALL CONFIRMED DIRECTLY (2026-08-28)
+---------------------------------------------------------------------------
+With the ScraperAPI/Serper fix finally live and returning real listings,
+the user raised four separate, concrete follow-ups -- each checked against
+a real URL before writing any fix, not guessed at:
+  - jskre.com: asked for results to land on the actual property page
+    (gave a real one: /properties/furnished-duplex-...-l21285). Confirmed
+    via a real fetch that this URL IS a proper individual listing page
+    with its own og:image -- so the underlying scrape/rank pipeline is
+    already right for a site like this; see the og:image work below for
+    what was actually missing (a thumbnail, not the link itself).
+  - confidencerealestate.com/property-location/jbeil/: confirmed via a
+    real fetch to be an essentially blank page -- full <head>/meta tags,
+    zero real body content, a normal HTTP 200 the whole way. Neither an
+    obvious "/search"/"/category/" path nor a bot-challenge page, so
+    nothing in this file caught it before. "/property-location/" is
+    WPEstate's own location-taxonomy archive path (the same WordPress
+    theme Arkan itself runs on -- see the 2026-08-24 section above) --
+    several OTHER_KNOWN_PORTALS entries likely share it. Fixed two ways:
+    added to NON_LISTING_PATH_MARKERS as a cheap static filter, AND (the
+    real, general fix, since no fixed marker list can catch every site's
+    own broken/empty page) _looks_dead_page() now actually reads a
+    fetched page's real body text and drops anything suspiciously short
+    or containing obvious "not found"/"no longer available" phrasing --
+    see _finalize_and_enrich() for where this runs on every result that
+    hasn't already been read once for another reason.
+  - Facebook/Instagram: asked to land on the actual post, not the page/
+    profile. _looks_like_listing_page() now checks those two domains
+    specifically -- a bare facebook.com/<name>/ or instagram.com/<name>/
+    is rejected the same as a search/category page; only a real post-
+    shaped path (facebook.com/.../posts/..., /permalink..., Marketplace
+    item URLs; instagram.com/p/<code>/ or /reel/<code>/) passes through.
+  - The two real, confirmed-live Arkan listings that never showed up for
+    "3 bedrooms in Jbeil" (a 210 sqm Amchit garden apartment, and a Jbeil/
+    Byblos development) -- see search_arkan()'s 2026-08-28 comment: a real
+    fetch of the city archive page showed 4 total pages, and neither
+    listing was among the ~10 on page 1. Fixed by fetching more pages
+    (ARKAN_PAGES_PER_SEARCH) in the same single concurrent batch as
+    before, not a guarantee for every district but a real, evidence-based
+    improvement in coverage.
+
+THUMBNAILS (added 2026-08-28, same round -- the user asked for images
+alongside each property, not just a link)
+---------------------------------------------------------------------------
+Two sources for a thumbnail, used in order of how cheap they are:
+  - Arkan/OLX cards already carry their own thumbnail <img> right there on
+    the archive page this code already fetches to find them in the first
+    place -- _parse_arkan_cards()/_parse_olx_cards() now pull that image
+    straight out of the card (preferring a lazy-load data-src/data-lazy-
+    src attribute over a possibly-placeholder src), at zero extra cost:
+    no additional fetch, no additional latency.
+  - Everything else (other portals, open web) gets its image from the
+    Open Graph/Twitter Card <meta> tags on the listing's own page --
+    confirmed (via a real fetch of jskre.com's listing page) to be how
+    virtually any real estate site already exposes a representative photo
+    for link-preview purposes, site-markup-agnostic by design. This reuses
+    a detail-page fetch that was often already happening anyway (bedroom
+    confirmation via _resolve_bedrooms); _finalize_and_enrich() covers the
+    remaining candidates (no bedroom count was requested, or a card's own
+    teaser already stated it, so no detail fetch had happened yet) with a
+    final short, plain (never render=True -- these are never Arkan/OLX)
+    pass, which is also where _looks_dead_page() gets applied to catch a
+    broken link before it ever reaches the person, pulling in the next-
+    best real candidate from a slightly oversized ranked pool
+    (RESULT_RESERVOIR_BUFFER) instead of just running a result short.
 """
 
 import logging
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -379,6 +445,8 @@ HEADERS = {
 }
 
 ARKAN_BASE = "https://arkanestate.com"
+# See search_arkan()'s 2026-08-28 comment for why this is 4, not 2.
+ARKAN_PAGES_PER_SEARCH = 4
 
 # Confirmed by fetching https://arkanestate.com/property_area-sitemap.xml
 # on 2026-08-24 -- Arkan's fine-grained neighborhood/town archive pages
@@ -503,6 +571,15 @@ BEDROOM_DETAIL_FETCH_CAP = 8
 # arbitrary third-party sites (slower/less predictable to fetch) and this
 # pass runs on top of, not instead of, Arkan+OLX's own checks.
 DDG_BEDROOM_DETAIL_FETCH_CAP = 6
+# _finalize_and_enrich()'s final pass (dead-page check + thumbnail
+# backfill, see module docstring's 2026-08-28 "THUMBNAILS" section) can
+# drop a handful of candidates that turn out to be broken/blank pages --
+# without some spare candidates already ranked and waiting, that would
+# just make a reply come back short instead of full. So _rank_and_fill()
+# is asked for `limit + RESULT_RESERVOIR_BUFFER` candidates (still ranked
+# best-first, so the extras are only ever used to backfill a dropped
+# slot, never to bump a genuinely worse result ahead of a better one).
+RESULT_RESERVOIR_BUFFER = 10
 
 
 def _slugify(text):
@@ -588,6 +665,28 @@ def _dedupe_hrefs_prefer_text(anchors):
     return [(href, best[href][0], best[href][1]) for href in order]
 
 
+def _extract_card_image(card, base_url):
+    """Pulls a thumbnail straight out of a search-results card's own <img>
+    tag -- zero extra cost, since the archive page these cards live on is
+    already being fetched anyway to find the listings in the first place
+    (added 2026-08-28 per the user's "add thumbnails" request). Prefers a
+    lazy-load attribute (data-src/data-lazy-src/data-original) over a plain
+    src, since many WordPress/Next.js card grids ship a tiny shared
+    placeholder in src and only swap in the real photo once JavaScript/
+    scroll-triggered lazy-loading actually fires -- something a plain
+    fetch never triggers, so reading src literally would often hand back
+    the same placeholder graphic for every single card. Returns an
+    absolute URL, or None if the card has no usable image at all."""
+    img = card.find("img")
+    if img is None:
+        return None
+    for attr in ("data-src", "data-lazy-src", "data-original", "src"):
+        value = img.get(attr)
+        if value and not value.strip().lower().startswith("data:"):
+            return urljoin(base_url, value.strip())
+    return None
+
+
 def _parse_arkan_cards(html, transaction_type, property_type,
                         min_price, max_price, limit):
     """Parses Arkan's location-archive card grid. Does NOT filter by
@@ -629,6 +728,7 @@ def _parse_arkan_cards(html, transaction_type, property_type,
             "price_usd": price,
             "snippet": text_block[:220],
             "bedrooms_hint": _extract_bedroom_count(text_block),
+            "image_url": _extract_card_image(card, ARKAN_BASE),
         })
         if len(results) >= limit:
             break
@@ -785,6 +885,62 @@ def _fetch(url, timeout=REQUEST_TIMEOUT, retries=1, render=False):
             return None
 
 
+def _extract_og_image(html, base_url):
+    """Pulls a thumbnail image URL out of a fetched page's Open Graph /
+    Twitter Card meta tags. Confirmed 2026-08-28 via a real fetch of a
+    jskre.com listing page to be how virtually every real estate site
+    (including ones this code has no custom parser for) already exposes a
+    representative photo -- built for link-preview purposes, but works
+    just as well here, and is far more reliable than guessing each site's
+    own card-image markup. Returns an absolute URL, or None if no such tag
+    is present."""
+    if not html:
+        return None
+    soup = BeautifulSoup(html, "html.parser")
+    for attrs in (
+        {"property": "og:image"},
+        {"name": "og:image"},
+        {"property": "twitter:image"},
+        {"name": "twitter:image"},
+    ):
+        tag = soup.find("meta", attrs=attrs)
+        content = tag.get("content") if tag else None
+        if content and content.strip():
+            return urljoin(base_url, content.strip())
+    return None
+
+
+# A real listing page always has a meaningful amount of actual body text
+# (price, description, specs, location) -- a blank/broken page does not,
+# even though it can still return a normal HTTP 200 with a fully-formed
+# <head> (meta tags, title) and no real <body> content at all. Confirmed
+# 2026-08-28 against a real broken URL the user hit
+# (confidencerealestate.com/property-location/jbeil/ -- a real 200 with a
+# complete set of meta tags but nothing else). 250 characters is a
+# conservative floor: comfortably below even a terse real listing's own
+# description, comfortably above the stray nav/footer text an empty
+# template page still renders.
+DEAD_PAGE_TEXT_MARKERS = (
+    "page not found", "404 not found", "no longer available",
+    "listing has been removed", "this ad is no longer", "property not found",
+)
+DEAD_PAGE_MIN_TEXT_LENGTH = 250
+
+
+def _looks_dead_page(html):
+    """Is this fetched page essentially blank/broken rather than a real,
+    live listing? See _finalize_and_enrich() for where this actually keeps
+    a broken link from ever reaching the person, instead of just being
+    informational."""
+    if not html:
+        return True
+    text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
+    lower = text.lower()
+    if any(marker in lower for marker in DEAD_PAGE_TEXT_MARKERS):
+        return True
+    return len(text) < DEAD_PAGE_MIN_TEXT_LENGTH
+
+
 def _resolve_bedrooms(candidates, bedrooms, cap=BEDROOM_DETAIL_FETCH_CAP):
     """Confirms/rejects a requested bedroom count across a list of candidate
     listings, returning (matched, close_matches) -- NEITHER list discards a
@@ -834,18 +990,40 @@ def _resolve_bedrooms(candidates, bedrooms, cap=BEDROOM_DETAIL_FETCH_CAP):
         with ThreadPoolExecutor(max_workers=min(8, len(to_check))) as pool:
             detail_htmls = list(pool.map(_fetch_detail, to_check))
         for item, html in zip(to_check, detail_htmls):
-            confirmed = None
-            if html:
-                page_text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
-                confirmed = _extract_bedroom_count(page_text)
-                # Free bonus while the page is already open: fill in price
-                # too if this candidate didn't have one yet (common for
-                # DuckDuckGo-sourced items, whose search snippet rarely
-                # states it) -- used for ranking (see _score_result).
-                if not item.get("price_usd"):
-                    detail_price = _clean_price(page_text)
-                    if detail_price:
-                        item["price_usd"] = detail_price
+            # Added 2026-08-28: this candidate's own page is already being
+            # fetched right here anyway (to confirm bedroom count) -- a
+            # free, zero-extra-cost place to also check it isn't a broken/
+            # blank page (see _looks_dead_page, and the module docstring's
+            # 2026-08-28 section for the real confidencerealestate.com
+            # example that motivated this) and to grab a thumbnail image
+            # (see _extract_og_image) while the HTML is already in hand.
+            # A dead-looking page is dropped entirely, not just marked
+            # unconfirmed -- a fetch that failed outright, or a page this
+            # broken, isn't something to ever hand to the person as a real
+            # result. "_verified" tells _finalize_and_enrich() this
+            # candidate has already been checked once here, so it doesn't
+            # get fetched a second time later.
+            if _looks_dead_page(html):
+                logger.warning(
+                    "Dropping candidate whose own page looks dead/broken "
+                    "(empty, 404, or fetch failed): %s", item["url"],
+                )
+                continue
+            page_text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
+            confirmed = _extract_bedroom_count(page_text)
+            # Free bonus while the page is already open: fill in price
+            # too if this candidate didn't have one yet (common for
+            # DuckDuckGo-sourced items, whose search snippet rarely
+            # states it) -- used for ranking (see _score_result).
+            if not item.get("price_usd"):
+                detail_price = _clean_price(page_text)
+                if detail_price:
+                    item["price_usd"] = detail_price
+            if not item.get("image_url"):
+                og_image = _extract_og_image(html, item["url"])
+                if og_image:
+                    item["image_url"] = og_image
+            item["_verified"] = True
             if confirmed is not None:
                 item["bedrooms"] = confirmed
             (matched if confirmed == bedrooms else close_matches).append(item)
@@ -871,7 +1049,23 @@ def search_arkan(area, transaction_type="sale", property_type=None,
     fetched_any = False
 
     if location_url:
-        pages = [location_url, location_url.rstrip("/") + "/page/2/"]
+        # Bumped from 2 pages to ARKAN_PAGES_PER_SEARCH (2026-08-28) -- the
+        # user asked why two real, confirmed-live listings (a 210 sqm
+        # Amchit garden apartment, and a Jbeil/Byblos development) never
+        # showed up for "3 bedrooms in Jbeil". A real fetch of
+        # arkanestate.com/city/jbeil/ showed pagination reading "1 2 3 4"
+        # -- 4 total pages for this one district -- and neither listing
+        # was among the ~10 on page 1. Fetching more pages concurrently
+        # (still one single batch, so worst-case latency stays bounded by
+        # the slowest individual page, not the sum) covers a district's
+        # full inventory far more often. Not a guarantee for every area --
+        # a bigger city could have more than ARKAN_PAGES_PER_SEARCH pages
+        # -- but this trades a bounded, modest increase in ScraperAPI
+        # credits/concurrent connections for meaningfully better coverage.
+        pages = [
+            location_url if i == 0 else location_url.rstrip("/") + f"/page/{i + 1}/"
+            for i in range(ARKAN_PAGES_PER_SEARCH)
+        ]
         with ThreadPoolExecutor(max_workers=len(pages)) as pool:
             # render=True: Arkan sends every plain fetch a blank
             # "wait 5 seconds and reload" page instead of real listings --
@@ -1032,6 +1226,7 @@ def _parse_olx_cards(html, property_type, limit):
             "price_usd": _clean_price(text_block),
             "snippet": text_block[:220],
             "bedrooms_hint": _extract_bedroom_count(text_block),
+            "image_url": _extract_card_image(card, OLX_BASE),
         })
         if len(results) >= limit:
             break
@@ -1078,7 +1273,28 @@ def _scrape_olx_cards(url, property_type, limit):
 
 NON_LISTING_PATH_MARKERS = (
     "/search", "/category/", "/categories/", "/tag/", "/tags/", "/page/",
+    # "/property-location/" added 2026-08-28: WPEstate's own location-
+    # taxonomy archive path (same theme Arkan itself runs -- see the
+    # 2026-08-24 section above), confirmed via a real, blank/broken
+    # example the user hit on confidencerealestate.com. Several
+    # OTHER_KNOWN_PORTALS entries likely share this same WPEstate-based
+    # URL scheme, so this one marker covers more than just that one site.
+    "/property-location/",
 )
+
+# Facebook/Instagram need their own rule, not the generic path-marker list
+# above -- added 2026-08-28 per explicit feedback: a result must land on
+# the actual post, never a bare page/profile. A post-shaped path is the
+# allowlist here (rather than a denylist like NON_LISTING_PATH_MARKERS)
+# because a bare facebook.com/<name>/ or instagram.com/<name>/ has no
+# distinguishing marker of its own to deny -- it just looks like any other
+# short path, so the safe default for these two domains specifically is
+# "reject unless it clearly looks like one specific post."
+FACEBOOK_POST_PATH_MARKERS = (
+    "/posts/", "/permalink", "/photo.php", "/photo/", "/videos/",
+    "/watch/", "/marketplace/item/", "/story.php",
+)
+INSTAGRAM_POST_PATH_RE = re.compile(r"^/(p|reel|tv)/[^/]+")
 
 
 def _looks_like_listing_page(url):
@@ -1092,9 +1308,18 @@ def _looks_like_listing_page(url):
     2026-08-25 per explicit feedback: a result needs to land directly on
     the property, not on a site's own search page -- the entire point of
     scraping real listing links instead of handing back a portal search
-    URL."""
+    URL. Extended 2026-08-28 with Facebook/Instagram-specific handling
+    (see FACEBOOK_POST_PATH_MARKERS/INSTAGRAM_POST_PATH_RE) -- a page/
+    profile is never acceptable there, only an actual post."""
     parsed = urlparse(url)
+    domain = parsed.netloc.lower()
     path = parsed.path.rstrip("/").lower()
+
+    if "facebook.com" in domain:
+        return any(marker in path for marker in FACEBOOK_POST_PATH_MARKERS)
+    if "instagram.com" in domain:
+        return bool(INSTAGRAM_POST_PATH_RE.match(path))
+
     if not path:
         return False
     if any(marker in path for marker in NON_LISTING_PATH_MARKERS):
@@ -1462,6 +1687,70 @@ def _rank_and_fill(pool, arkan_items, market_items, bedrooms, min_price,
         add_fn(item, pool)
 
 
+def _finalize_and_enrich(ranked_candidates, limit):
+    """Last stop before a ranked candidate pool becomes the actual reply:
+    drops anything that turns out to be a broken/blank page, backfills a
+    thumbnail for whatever candidate doesn't already have one, and trims
+    the (deliberately oversized, see RESULT_RESERVOIR_BUFFER) pool down to
+    exactly `limit` -- all without ever demoting a better-ranked real
+    result in favor of a worse one that merely happened to get checked.
+
+    `ranked_candidates` must already be in best-first order (this never
+    re-sorts). Most items arrive already "_verified" -- either their own
+    detail page was already fetched once by _resolve_bedrooms() (bedroom
+    count was requested and the card's own teaser didn't say), or they're
+    an Arkan/OLX card that got its thumbnail straight from the archive
+    page's own markup for free (see _extract_card_image) and doesn't need
+    a second visit just to double-check it's alive. Only the leftover
+    candidates -- no bedroom count was requested, or the card's teaser
+    already stated it, so _resolve_bedrooms() never opened this one's
+    page -- get fetched here.
+
+    That fetch is deliberately a plain, short, non-rendering one
+    (_fetch()'s render=False default, REQUEST_TIMEOUT's ~10s), and is
+    deliberately skipped entirely for Arkan/OLX candidates even when they
+    aren't "_verified": those two sites need a real 70s-class rendering
+    browser to show anything at all (see RENDER_REQUIRED_DOMAINS / module
+    docstring's 2026-08-26 section) -- a plain fetch there wouldn't reveal
+    a real dead link, it would just misread a normal reload-and-wait stub
+    as a dead page and wrongly discard a perfectly live listing."""
+    to_check = [
+        item for item in ranked_candidates
+        if not item.get("_verified") and not _needs_render(item["url"])
+    ]
+
+    if to_check:
+        def _check(item):
+            return _fetch(item["url"], retries=0)
+
+        with ThreadPoolExecutor(max_workers=min(8, len(to_check))) as pool:
+            htmls = list(pool.map(_check, to_check))
+        for item, html in zip(to_check, htmls):
+            if _looks_dead_page(html):
+                item["_dead"] = True
+                logger.warning(
+                    "_finalize_and_enrich: dropping candidate whose own "
+                    "page looks dead/broken (empty, 404, or fetch "
+                    "failed): %s", item["url"],
+                )
+                continue
+            if not item.get("image_url"):
+                og_image = _extract_og_image(html, item["url"])
+                if og_image:
+                    item["image_url"] = og_image
+
+    final = []
+    for item in ranked_candidates:
+        if item.get("_dead"):
+            continue
+        item.pop("_verified", None)
+        item.pop("_dead", None)
+        final.append(item)
+        if len(final) >= limit:
+            break
+    return final
+
+
 def search_properties(area, transaction_type="sale", property_type=None,
                        min_price=None, max_price=None, bedrooms=None,
                        include_public_sources=True, limit=10):
@@ -1522,10 +1811,17 @@ def search_properties(area, transaction_type="sale", property_type=None,
         bucket.append(item)
         return True
 
+    # Asked for more than `limit` here (see RESULT_RESERVOIR_BUFFER) so
+    # _finalize_and_enrich() below has real, already-ranked spares to pull
+    # from if it has to drop a candidate whose own page turns out to be
+    # broken -- still ranked best-first throughout, so a spare only ever
+    # backfills a dropped slot, never bumps ahead of a better result.
+    reservoir_limit = limit + RESULT_RESERVOIR_BUFFER
+
     merged = []
     _rank_and_fill(
         merged, arkan_out.get("results", []), market_out.get("results", []),
-        bedrooms, min_price, max_price, limit, _add,
+        bedrooms, min_price, max_price, reservoir_limit, _add,
     )
 
     # A bedroom count was requested but confirmed exact matches alone are
@@ -1533,12 +1829,18 @@ def search_properties(area, transaction_type="sale", property_type=None,
     # close matches (see search_arkan/search_market/_resolve_bedrooms),
     # ranked the same way, rather than leaving the reply with little or
     # nothing to actually show.
-    if bedrooms and len(merged) < limit:
+    if bedrooms and len(merged) < reservoir_limit:
         _rank_and_fill(
             merged, arkan_out.get("close_matches", []),
             market_out.get("close_matches", []),
-            bedrooms, min_price, max_price, limit, _add,
+            bedrooms, min_price, max_price, reservoir_limit, _add,
         )
+
+    # Final pass: drop anything that turns out to be a broken/blank page,
+    # backfill a thumbnail for whatever candidate doesn't already have
+    # one, and trim the (deliberately oversized) reservoir down to exactly
+    # `limit` real, live results -- see _finalize_and_enrich().
+    merged = _finalize_and_enrich(merged, limit)
 
     # True only if EVERY source this call actually tried (Arkan, and OLX +
     # both DuckDuckGo queries when include_public_sources is on) failed to
