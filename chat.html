@@ -93,6 +93,7 @@
   @keyframes blink { 0%, 80%, 100% { opacity: 0.25; } 40% { opacity: 1; } }
 
   .composer {
+    position: relative;
     flex-shrink: 0;
     display: flex;
     align-items: flex-end;
@@ -103,6 +104,7 @@
   }
   .composer textarea {
     flex: 1;
+    min-width: 0;
     resize: none;
     border: 1px solid var(--border);
     border-radius: 20px;
@@ -127,6 +129,7 @@
   }
   .icon-btn:hover { background: var(--green-dark); }
   .icon-btn:active { transform: scale(0.94); }
+  .icon-btn.mic { touch-action: none; user-select: none; -webkit-user-select: none; }
   .icon-btn.mic.recording {
     background: #e63946;
     animation: pulse 1.1s infinite;
@@ -136,6 +139,81 @@
     70% { box-shadow: 0 0 0 10px rgba(230,57,70,0); }
     100% { box-shadow: 0 0 0 0 rgba(230,57,70,0); }
   }
+
+  /* --- WhatsApp-style voice recording bar --- */
+  .cancel-rec-btn {
+    display: none;
+    background: #8b9599;
+  }
+  .cancel-rec-btn:hover { background: #6f797d; }
+  .composer.recording textarea { display: none; }
+  .composer.recording:not(.locked) #sendBtn { display: none; }
+  .composer.locked #micBtn { display: none; }
+  .composer.locked #cancelRecBtn { display: flex; }
+
+  .recording-bar {
+    display: none;
+    flex: 1;
+    min-width: 0;
+    align-items: center;
+    gap: 10px;
+    height: 42px;
+    padding: 0 4px;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  .composer.recording .recording-bar { display: flex; }
+
+  .rec-dot {
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    background: #e63946;
+    flex-shrink: 0;
+    animation: recblink 1.1s infinite;
+  }
+  @keyframes recblink { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+
+  .rec-timer {
+    font-size: 14px;
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
+    flex-shrink: 0;
+    min-width: 34px;
+  }
+
+  .slide-hint {
+    flex: 1;
+    min-width: 0;
+    text-align: center;
+    font-size: 13px;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .composer.locked .slide-hint { display: none; }
+
+  .lock-pill {
+    display: none;
+    position: absolute;
+    left: 16px;
+    bottom: 58px;
+    width: 34px;
+    padding: 8px 0 10px;
+    border-radius: 17px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    color: var(--muted);
+    box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+  }
+  .composer.recording:not(.locked) .lock-pill { display: flex; }
+  .lock-pill .lock-arrow { font-size: 11px; animation: lockbounce 1.4s infinite; }
+  @keyframes lockbounce { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-3px); } }
+
   .hint {
     text-align: center;
     font-size: 11.5px;
@@ -166,16 +244,23 @@
 
   <div class="messages" id="messages">
     <div class="bubble-row bot">
-      <div class="bubble" dir="auto">مرحبا! أنا بيت 🏠 — Ask me anything about buying, renting, or investing in Lebanese real estate. Type in Arabic, French, or English, or tap the mic to talk.</div>
+      <div class="bubble" dir="auto">مرحبا! أنا بيت 🏠 — Ask me anything about buying, renting, or investing in Lebanese real estate. Type in Arabic, French, or English, or hold the mic to talk.</div>
     </div>
   </div>
 
-  <div class="composer">
-    <button class="icon-btn mic" id="micBtn" title="Record a voice message">🎤</button>
+  <div class="composer" id="composer">
+    <button class="icon-btn mic" id="micBtn" title="Hold to record — slide up to lock, slide left to cancel">🎤</button>
+    <button class="icon-btn cancel-rec-btn" id="cancelRecBtn" title="Cancel recording">🗑</button>
     <textarea id="textInput" rows="1" placeholder="Type a message… (Arabic / Français / English)"></textarea>
+    <div class="recording-bar" id="recordingBar">
+      <span class="rec-dot"></span>
+      <span class="rec-timer" id="recTimer">0:00</span>
+      <span class="slide-hint" id="slideHint">‹ Slide to cancel</span>
+    </div>
     <button class="icon-btn" id="sendBtn" title="Send">➤</button>
+    <div class="lock-pill" id="lockPill"><span class="lock-arrow">⌃</span><span class="lock-icon">🔒</span></div>
   </div>
-  <div class="hint">Beit can search Arkan Estate and the wider Lebanese market, and explain property law &amp; investment questions.</div>
+  <div class="hint">Beit searches listings across the Lebanese market and can explain property law &amp; investment questions. Hold the mic to record a voice message.</div>
 </div>
 
 <script>
@@ -184,6 +269,12 @@ const messagesEl = document.getElementById('messages');
 const textInput = document.getElementById('textInput');
 const sendBtn = document.getElementById('sendBtn');
 const micBtn = document.getElementById('micBtn');
+const composerEl = document.getElementById('composer');
+const cancelRecBtn = document.getElementById('cancelRecBtn');
+const recordingBar = document.getElementById('recordingBar');
+const recTimer = document.getElementById('recTimer');
+const slideHint = document.getElementById('slideHint');
+const lockPill = document.getElementById('lockPill');
 const errorBanner = document.getElementById('errorBanner');
 
 function showError(msg) {
@@ -197,11 +288,10 @@ function scrollToBottom() {
 }
 
 // The bot's replies can contain markdown links (from search results, e.g.
-// "[Arkan: Jbeil listings](https://arkanestate.com/city/jbeil/)") and
-// **bold** text. The user's own messages never do, so only bot bubbles run
-// through this -- everything is HTML-escaped first, so this can't be used
-// to inject markup, it just turns that specific escaped syntax back into
-// real <a>/<strong> tags.
+// "[3BR apartment, Jbeil](https://example.com/listing)") and **bold** text.
+// The user's own messages never do, so only bot bubbles run through this --
+// everything is HTML-escaped first, so this can't be used to inject markup,
+// it just turns that specific escaped syntax back into real <a>/<strong> tags.
 function escapeHtml(str) {
   return str.replace(/[&<>"']/g, (c) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
@@ -309,51 +399,279 @@ textInput.addEventListener('keydown', (e) => {
     sendText();
   }
 });
-sendBtn.addEventListener('click', sendText);
 
-// --- Voice recording ---
+// --- Voice recording: WhatsApp-style press-and-hold ---
+//
+// Gesture (unified for mouse + touch via the Pointer Events API):
+//   - Press and hold the mic  -> recording starts, a live timer + "slide to
+//     cancel" bar replaces the text field.
+//   - Drag left past a threshold -> cancels and discards the recording.
+//   - Drag up past a threshold   -> "locks" the recording hands-free: the
+//     mic becomes a cancel (trash) button and the send button becomes
+//     "stop and send", so you don't have to keep holding your finger down.
+//   - Release without locking/cancelling -> stops and sends immediately.
+//
+// Also fixes a real bug from the old tap-to-toggle version: the recorded
+// Blob was always hard-coded to `audio/webm` / filename "recording.webm"
+// regardless of what MediaRecorder actually produced. Safari (desktop and
+// iOS) does not support webm and records audio/mp4 instead -- uploading
+// that mislabeled as .webm gave the server's ffmpeg step the wrong
+// container hint and could fail to transcribe. Fixed by always reading the
+// *actual* `mediaRecorder.mimeType` after creation and using it for both
+// the Blob type and the uploaded filename's extension.
+const CANCEL_DRAG_PX = 90;
+const LOCK_DRAG_PX = 70;
+
 let mediaRecorder = null;
+let mediaStream = null;
 let audioChunks = [];
-let recording = false;
+let chosenMimeType = '';
+let recordState = 'idle'; // 'idle' | 'requesting' | 'holding' | 'locked'
+let recordStartMs = 0;
+let timerHandle = null;
+let activePointerId = null;
+let gestureStartX = 0;
+let gestureStartY = 0;
+let cancelledByDrag = false;
 
-async function toggleRecording() {
-  if (!recording) {
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      showError('Voice recording is not supported in this browser.');
-      return;
-    }
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      audioChunks = [];
-      mediaRecorder = new MediaRecorder(stream);
-      mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) audioChunks.push(e.data); };
-      mediaRecorder.onstop = () => {
-        stream.getTracks().forEach((t) => t.stop());
-        const blob = new Blob(audioChunks, { type: 'audio/webm' });
-        if (blob.size < 500) {
-          showError('Recording was too short — try again.');
-          return;
-        }
-        appendMessage('user', '🎤 Voice message');
-        const form = new FormData();
-        form.append('session_id', sessionId);
-        form.append('audio', blob, 'recording.webm');
-        postToAgent(form);
-      };
-      mediaRecorder.start();
-      recording = true;
-      micBtn.classList.add('recording');
-    } catch (err) {
-      showError('Microphone permission was denied.');
-    }
-  } else {
-    mediaRecorder.stop();
-    recording = false;
-    micBtn.classList.remove('recording');
+function pickSupportedMimeType() {
+  if (typeof MediaRecorder === 'undefined' || !MediaRecorder.isTypeSupported) return '';
+  const candidates = [
+    'audio/webm;codecs=opus',
+    'audio/webm',
+    'audio/mp4;codecs=mp4a.40.2',
+    'audio/mp4',
+    'audio/ogg;codecs=opus',
+    'audio/ogg',
+  ];
+  for (const type of candidates) {
+    if (MediaRecorder.isTypeSupported(type)) return type;
+  }
+  return '';
+}
+
+function extensionForMimeType(mimeType) {
+  if (!mimeType) return '.webm';
+  if (mimeType.includes('mp4') || mimeType.includes('m4a')) return '.m4a';
+  if (mimeType.includes('ogg')) return '.ogg';
+  return '.webm';
+}
+
+function formatTimer(ms) {
+  const totalSec = Math.max(0, Math.floor(ms / 1000));
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return m + ':' + String(s).padStart(2, '0');
+}
+
+function startTimerUI() {
+  recTimer.textContent = '0:00';
+  timerHandle = setInterval(() => {
+    recTimer.textContent = formatTimer(Date.now() - recordStartMs);
+  }, 250);
+}
+
+function stopTimerUI() {
+  if (timerHandle) {
+    clearInterval(timerHandle);
+    timerHandle = null;
   }
 }
 
-micBtn.addEventListener('click', toggleRecording);
+function resetGestureUI() {
+  composerEl.classList.remove('recording', 'locked');
+  micBtn.classList.remove('recording');
+  recTimer.textContent = '0:00';
+  slideHint.style.transform = '';
+  slideHint.style.opacity = '1';
+  lockPill.style.transform = '';
+}
+
+function lockRecording() {
+  if (recordState !== 'holding') return;
+  recordState = 'locked';
+  composerEl.classList.add('locked');
+  if (activePointerId !== null) {
+    try { micBtn.releasePointerCapture(activePointerId); } catch (err) { /* ignore */ }
+  }
+  activePointerId = null;
+}
+
+function finishRecording(cancel) {
+  if (recordState !== 'holding' && recordState !== 'locked') return;
+  cancelledByDrag = cancel;
+  recordState = 'stopping';
+  stopTimerUI();
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+    mediaRecorder.stop();
+  } else {
+    handleRecordingStopped();
+  }
+}
+
+function handleRecordingStopped() {
+  if (mediaStream) {
+    mediaStream.getTracks().forEach((t) => t.stop());
+    mediaStream = null;
+  }
+  const elapsedMs = Date.now() - recordStartMs;
+  const wasCancelled = cancelledByDrag;
+  resetGestureUI();
+  recordState = 'idle';
+
+  if (wasCancelled) {
+    audioChunks = [];
+    return;
+  }
+  if (elapsedMs < 500 || audioChunks.length === 0) {
+    showError('Recording was too short — try again.');
+    audioChunks = [];
+    return;
+  }
+  const blob = new Blob(audioChunks, { type: chosenMimeType || 'audio/webm' });
+  audioChunks = [];
+  if (blob.size < 500) {
+    showError('Recording was too short — try again.');
+    return;
+  }
+  appendMessage('user', '🎤 Voice message');
+  const form = new FormData();
+  form.append('session_id', sessionId);
+  form.append('audio', blob, 'recording' + extensionForMimeType(chosenMimeType));
+  postToAgent(form);
+}
+
+micBtn.addEventListener('pointerdown', async (e) => {
+  if (recordState !== 'idle') return;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    showError('Voice recording is not supported in this browser.');
+    return;
+  }
+
+  recordState = 'requesting';
+  activePointerId = e.pointerId;
+  gestureStartX = e.clientX;
+  gestureStartY = e.clientY;
+  cancelledByDrag = false;
+  try { micBtn.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (err) {
+    recordState = 'idle';
+    activePointerId = null;
+    showError('Microphone permission was denied.');
+    return;
+  }
+
+  // The user may have already released (or dragged past cancel) while the
+  // permission prompt was still up -- if so, back out instead of starting.
+  if (recordState !== 'requesting') {
+    stream.getTracks().forEach((t) => t.stop());
+    return;
+  }
+
+  mediaStream = stream;
+  audioChunks = [];
+  chosenMimeType = pickSupportedMimeType();
+  try {
+    mediaRecorder = chosenMimeType
+      ? new MediaRecorder(stream, { mimeType: chosenMimeType })
+      : new MediaRecorder(stream);
+  } catch (err) {
+    try {
+      mediaRecorder = new MediaRecorder(stream);
+    } catch (err2) {
+      stream.getTracks().forEach((t) => t.stop());
+      mediaStream = null;
+      recordState = 'idle';
+      activePointerId = null;
+      showError('Voice recording is not supported in this browser.');
+      return;
+    }
+  }
+  chosenMimeType = mediaRecorder.mimeType || chosenMimeType || 'audio/webm';
+
+  mediaRecorder.ondataavailable = (ev) => {
+    if (ev.data && ev.data.size > 0) audioChunks.push(ev.data);
+  };
+  mediaRecorder.onstop = handleRecordingStopped;
+  mediaRecorder.start();
+
+  recordState = 'holding';
+  recordStartMs = Date.now();
+  startTimerUI();
+  composerEl.classList.add('recording');
+  micBtn.classList.add('recording');
+});
+
+micBtn.addEventListener('pointermove', (e) => {
+  if (activePointerId === null || e.pointerId !== activePointerId) return;
+  if (recordState !== 'holding') return;
+
+  const dx = e.clientX - gestureStartX;
+  const dy = e.clientY - gestureStartY;
+
+  const leftDrag = Math.max(0, -dx);
+  slideHint.style.transform = 'translateX(' + (-Math.min(leftDrag, CANCEL_DRAG_PX)) + 'px)';
+  slideHint.style.opacity = String(Math.max(0, 1 - leftDrag / CANCEL_DRAG_PX));
+  if (leftDrag > CANCEL_DRAG_PX) {
+    finishRecording(true);
+    return;
+  }
+
+  const upDrag = Math.max(0, -dy);
+  lockPill.style.transform = 'translateY(' + (-Math.min(upDrag, LOCK_DRAG_PX)) + 'px)';
+  if (upDrag > LOCK_DRAG_PX) {
+    lockRecording();
+  }
+});
+
+function onMicPointerUp(e) {
+  if (activePointerId === null || e.pointerId !== activePointerId) return;
+  if (recordState === 'requesting') {
+    recordState = 'idle';
+    activePointerId = null;
+    resetGestureUI();
+    return;
+  }
+  if (recordState === 'holding') {
+    activePointerId = null;
+    finishRecording(false);
+    return;
+  }
+  activePointerId = null;
+}
+
+micBtn.addEventListener('pointerup', onMicPointerUp);
+micBtn.addEventListener('pointercancel', (e) => {
+  if (activePointerId === null || e.pointerId !== activePointerId) return;
+  if (recordState === 'requesting') {
+    recordState = 'idle';
+    activePointerId = null;
+    resetGestureUI();
+    return;
+  }
+  activePointerId = null;
+  if (recordState === 'holding') {
+    finishRecording(true);
+  }
+});
+
+cancelRecBtn.addEventListener('click', () => {
+  if (recordState === 'locked') {
+    finishRecording(true);
+  }
+});
+
+sendBtn.addEventListener('click', () => {
+  if (recordState === 'locked') {
+    finishRecording(false);
+  } else {
+    sendText();
+  }
+});
 </script>
 </body>
 </html>
