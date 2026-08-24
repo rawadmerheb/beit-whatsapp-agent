@@ -243,9 +243,42 @@ domain root, or a path containing an obvious non-listing marker like
 DDG candidate is ever added to the pool -- a cheap, conservative check, not
 a guarantee, since there's no universal way to know a random third-party
 site's URL conventions for certain, but it catches the obvious cases.
+
+THE REAL CAUSE, CONFIRMED FOR CERTAIN (2026-08-26): THREE DIFFERENT WALLS,
+NONE OF THEM FIXABLE BY BETTER PARSING
+---------------------------------------------------------------------------
+Everything above (headers, retries, bot-challenge detection, snippet
+logging) was aimed at making a failure visible -- and it worked: deployed
+logs finally showed, in plain text, exactly what each source was actually
+returning. That confirmed three separate, real walls, none of them a bug
+in this file:
+  - Arkan: every fetch "succeeds" (HTTP 200) but the body is just
+    `<script>setTimeout(()=>location.reload(), 5000)</script>` -- a
+    JS-only check with no human-readable text at all, so it didn't match
+    _looks_like_bot_challenge()'s phrase list either. A plain HTTP client
+    can't run that script or see whatever it's waiting for.
+  - OLX: the fetched HTML is a legitimate, complete Next.js page shell --
+    but the actual listing cards are added afterward by client-side
+    JavaScript. There is nothing to parse in the raw HTML because the real
+    content doesn't exist yet at fetch time.
+  - DuckDuckGo: not a content problem at all -- Render's own outbound
+    connection to html.duckduckgo.com times out at the TCP level. DDG
+    blocks/throttles connections from cloud-hosting IP ranges outright.
+
+Fixed by adding two optional, paid services that solve each kind of wall
+(both fully optional -- everything works exactly as before if neither is
+configured; see SCRAPER_API_KEY / SERPER_API_KEY below):
+  - ScraperAPI fetches a URL through a real rendering browser (when
+    `render=True` -- see _needs_render()) plus a non-datacenter IP, which
+    handles both Arkan's JS reload-and-wait check and OLX's client-side
+    rendering, since the browser actually waits for the real content.
+  - Serper.dev returns real Google search results as plain JSON, replacing
+    the DuckDuckGo scrape entirely -- sidesteps the connection block
+    completely rather than trying to out-clever it.
 """
 
 import logging
+import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
@@ -539,14 +572,55 @@ BOT_CHALLENGE_MARKERS = (
 def _looks_like_bot_challenge(html):
     """Cheap heuristic, not a guarantee: does this fetched page look like a
     bot-check/verification wall rather than the real content? Not
-    exhaustive, but catches the common Cloudflare/anti-bot phrasing."""
+    exhaustive, but catches the common Cloudflare/anti-bot phrasing. Does
+    NOT catch a pure-JS reload-and-wait check with no human-readable text
+    at all (that's what Arkan turned out to actually do -- see module
+    docstring, 2026-08-26) -- there's no text to match in that case; the
+    real fix for that is ScraperAPI's render=True, not a smarter phrase
+    list."""
     if not html:
         return False
     lower = html.lower()
     return any(marker in lower for marker in BOT_CHALLENGE_MARKERS)
 
 
-def _fetch(url, timeout=REQUEST_TIMEOUT, retries=1):
+# --- Optional paid fallbacks for the two confirmed hard walls above ------
+# Both fully optional: unset SCRAPER_API_KEY/SERPER_API_KEY and everything
+# behaves exactly as before (plain direct fetches, DuckDuckGo scraping).
+# Set either one to switch that specific piece over. See module docstring's
+# 2026-08-26 section for exactly what each one fixes and why a code-only
+# fix isn't possible for either wall.
+SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY", "").strip()
+SCRAPER_API_ENDPOINT = "https://api.scraperapi.com/"
+# A rendered fetch (a real headless browser) takes much longer than a
+# plain one -- give it real room instead of timing out on exactly the
+# requests that need it most, while staying well under gunicorn's own
+# 120s worker timeout (see Dockerfile) even with a couple of these
+# running one after another within the same chat reply.
+SCRAPER_API_RENDER_TIMEOUT = 30
+# Only these two are confirmed to need a real rendering browser (see
+# _needs_render()) -- every other fetch still goes through ScraperAPI's
+# proxy when the key is set (for its non-datacenter IP alone), just
+# without paying render's extra cost/latency.
+RENDER_REQUIRED_DOMAINS = ("arkanestate.com", "olx.com.lb")
+
+# Serper.dev returns real Google search results as plain JSON -- replaces
+# the DuckDuckGo HTML scrape entirely when set, since DuckDuckGo's own
+# endpoint outright refuses the TCP connection from Render's IP range
+# (confirmed via a real connection timeout in production -- see module
+# docstring). 2,500 free queries to start, then roughly $0.30/1,000.
+SERPER_API_KEY = os.getenv("SERPER_API_KEY", "").strip()
+SERPER_ENDPOINT = "https://google.serper.dev/search"
+
+
+def _needs_render(url):
+    """Does this URL need a real rendering browser (see
+    RENDER_REQUIRED_DOMAINS), rather than a plain proxied fetch?"""
+    domain = urlparse(url).netloc.lower()
+    return any(d in domain for d in RENDER_REQUIRED_DOMAINS)
+
+
+def _fetch(url, timeout=REQUEST_TIMEOUT, retries=1, render=False):
     """GETs a URL and returns its HTML text, or None on failure.
 
     Retries once (no backoff -- the failed attempt already spent the full
@@ -556,16 +630,37 @@ def _fetch(url, timeout=REQUEST_TIMEOUT, retries=1):
     server response actively rejecting the request, and an identical retry
     won't change that, just waste time.
 
+    When SCRAPER_API_KEY is set, the request is routed through ScraperAPI's
+    proxy (a non-datacenter IP) instead of a direct requests.get(). Pass
+    render=True to additionally ask ScraperAPI to load the page in a real
+    headless browser and wait for it to finish -- needed for Arkan's JS
+    reload-and-wait check and OLX's client-rendered listings (see
+    _needs_render() and the module docstring's 2026-08-26 section); it
+    costs more credits and takes longer, so callers only set it for fetches
+    that actually need it. With no SCRAPER_API_KEY set, `render` is ignored
+    and this behaves exactly as before (a plain direct fetch).
+
     Every failure is logged via the standard `logging` module (so it shows
     up in Render's own log viewer) instead of vanishing silently -- see the
     module docstring's 2026-08-25 section for why this matters: a fetch
     failing here with zero trace of why is exactly what made a real
     production bug (real listings confirmed live on-site, zero results
     coming back from this code) impossible to diagnose from the outside."""
+    if SCRAPER_API_KEY:
+        request_url = SCRAPER_API_ENDPOINT
+        params = {"api_key": SCRAPER_API_KEY, "url": url}
+        if render:
+            params["render"] = "true"
+            timeout = max(timeout, SCRAPER_API_RENDER_TIMEOUT)
+        request_kwargs = {"params": params}
+    else:
+        request_url = url
+        request_kwargs = {"headers": HEADERS}
+
     attempts = retries + 1
     for attempt in range(attempts):
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=timeout)
+            resp = requests.get(request_url, timeout=timeout, **request_kwargs)
             resp.raise_for_status()
             return resp.text
         except requests.HTTPError as e:
@@ -618,8 +713,16 @@ def _resolve_bedrooms(candidates, bedrooms, cap=BEDROOM_DETAIL_FETCH_CAP):
     to_check = ambiguous[:cap]
     close_matches.extend(ambiguous[cap:])
     if to_check:
+        def _fetch_detail(it):
+            # Arkan/OLX individual listing pages sit behind the same wall
+            # as their archive pages (see module docstring, 2026-08-26) --
+            # render=True there too, or this would "succeed" while quietly
+            # fetching a reload-stub/empty shell instead of the real page.
+            needs_render = _needs_render(it["url"])
+            return _fetch(it["url"], render=needs_render, retries=0 if needs_render else 1)
+
         with ThreadPoolExecutor(max_workers=min(8, len(to_check))) as pool:
-            detail_htmls = list(pool.map(lambda it: _fetch(it["url"]), to_check))
+            detail_htmls = list(pool.map(_fetch_detail, to_check))
         for item, html in zip(to_check, detail_htmls):
             confirmed = None
             if html:
@@ -660,7 +763,12 @@ def search_arkan(area, transaction_type="sale", property_type=None,
     if location_url:
         pages = [location_url, location_url.rstrip("/") + "/page/2/"]
         with ThreadPoolExecutor(max_workers=len(pages)) as pool:
-            htmls = list(pool.map(_fetch, pages))
+            # render=True: Arkan sends every plain fetch a blank
+            # "wait 5 seconds and reload" page instead of real listings --
+            # see module docstring, 2026-08-26. retries=0 since a rendered
+            # fetch already takes a while; a second full-length retry
+            # risks the reply itself timing out for no real benefit.
+            htmls = list(pool.map(lambda u: _fetch(u, render=True, retries=0), pages))
         for page_url, html in zip(pages, htmls):
             if not html:
                 continue
@@ -689,7 +797,7 @@ def search_arkan(area, transaction_type="sale", property_type=None,
 
     if not candidates:
         fallback_url = f"{ARKAN_BASE}/?s={area}"
-        html = _fetch(fallback_url)
+        html = _fetch(fallback_url, render=True, retries=0)
         if html and _looks_like_bot_challenge(html):
             logger.warning(
                 "Arkan: got a response for %s but it looks like a bot "
@@ -834,7 +942,11 @@ def _scrape_olx_cards(url, property_type, limit):
     property_type filter, so callers can tell "OLX has nothing like that"
     apart from "OLX couldn't be reached at all" (see search_market /
     search_properties's "search_unavailable")."""
-    html = _fetch(url, timeout=OLX_TIMEOUT)
+    # render=True: OLX's category pages are a Next.js app whose listing
+    # cards are added by client-side JavaScript after the initial load --
+    # see module docstring, 2026-08-26. retries=0 for the same reason as
+    # Arkan's fetch above.
+    html = _fetch(url, timeout=OLX_TIMEOUT, render=True, retries=0)
     if not html:
         logger.warning("OLX: could not reach %s", url)
         return [], False
@@ -947,6 +1059,63 @@ def _ddg_search(query, limit):
     return out, True
 
 
+def _serper_search(query, limit):
+    """One query against Serper.dev's Google Search API. Used instead of
+    _ddg_search() when SERPER_API_KEY is set -- see module docstring,
+    2026-08-26: DuckDuckGo's own endpoint outright refuses the TCP
+    connection from Render's IP range (a real connection timeout,
+    confirmed in production), which no amount of retrying or better
+    headers can fix, since the connection itself never completes. Returns
+    (results, reached) in the same shape _ddg_search() returns, so
+    search_market() doesn't need to know or care which one actually ran."""
+    try:
+        resp = requests.post(
+            SERPER_ENDPOINT,
+            json={"q": query},
+            headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
+            timeout=REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except (requests.RequestException, ValueError) as e:
+        logger.warning("Serper search failed for query %r: %s", query, e)
+        return [], False
+
+    out = []
+    for res in data.get("organic", [])[:limit]:
+        link = res.get("link")
+        if not link:
+            continue
+        title = res.get("title", "")
+        snippet = res.get("snippet", "")
+        item = {"title": title, "url": link, "snippet": snippet}
+        combined_text = f"{title} {snippet}"
+        bedrooms_hint = _extract_bedroom_count(combined_text)
+        if bedrooms_hint is not None:
+            item["bedrooms"] = bedrooms_hint
+        price = _clean_price(combined_text)
+        if price is not None:
+            item["price_usd"] = price
+        out.append(item)
+    if not out:
+        logger.warning(
+            "Serper: query %r got a normal-looking response but 0 organic "
+            "results were in it.", query,
+        )
+    return out, True
+
+
+def _web_search(query, limit):
+    """Dispatches to Serper.dev when SERPER_API_KEY is configured (a paid,
+    reliable Google Search API -- see _serper_search()); otherwise falls
+    back to the free, no-key DuckDuckGo scrape (_ddg_search()), exactly as
+    before. Both return the same (results, reached) shape, so search_market
+    below doesn't need to know which one actually ran."""
+    if SERPER_API_KEY:
+        return _serper_search(query, limit)
+    return _ddg_search(query, limit)
+
+
 def search_market(area, transaction_type="sale", property_type=None,
                    bedrooms=None, limit=10):
     """Search the Lebanese market beyond Arkan: OLX scraped directly, the
@@ -979,7 +1148,7 @@ def search_market(area, transaction_type="sale", property_type=None,
 
     with ThreadPoolExecutor(max_workers=len(ddg_queries) + 1) as pool:
         olx_future = pool.submit(_scrape_olx_cards, olx_scrape_url, property_type, limit * 3)
-        ddg_futures = {pool.submit(_ddg_search, q, limit * 2): q for q in ddg_queries}
+        ddg_futures = {pool.submit(_web_search, q, limit * 2): q for q in ddg_queries}
 
         try:
             olx_results, olx_reached = olx_future.result()
