@@ -147,8 +147,77 @@ the combined pool by that score before taking the top `limit` -- still
 completely blind to which site a result came from, so this doesn't
 reintroduce source favoritism, it just stops treating "arrived first" as
 "best."
+
+A "NO RESULTS" REPLY WITH REAL LISTINGS ON THE ACTUAL SITE (found + fixed
+2026-08-25)
+---------------------------------------------------------------------------
+The user hit a case where a live search ("3 bedrooms in Jbeil") came back
+completely empty -- the reply fell back to "couldn't find anything, here's
+a bare OLX search link" even though a manual check of the exact same pages
+this code scrapes (arkanestate.com/city/jbeil/ and olx.com.lb's Jbeil
+for-sale page) showed both were, at that exact moment, fully live and full
+of real individual listings with URLs matching this code's own parsing
+patterns. That rules out "the sites changed their markup" or "there's
+nothing there" -- the pages were reachable and correctly structured; this
+code just wasn't getting through to them from wherever it's actually
+deployed. The most likely cause is the deployed server's own outbound
+requests being blocked/challenged by one or more of these sites as
+"automated traffic" (very common for shared-hosting IP ranges, especially
+against a classifieds site like OLX) -- and every previous version of this
+code made that completely invisible: every failed fetch was silently
+swallowed into an empty list with zero trace of why, anywhere.
+
+This didn't get fixed by throwing more logic at the ranking/fallback
+layer (there was already plenty of that -- close_matches, best-first
+ranking, etc.) -- none of it matters if the underlying fetches never
+succeed at all in the first place. Fixed by making failure visible and a
+little more resilient instead of just quieter:
+  - _fetch() now sends a fuller, more realistic set of browser-like
+    headers (Accept, Accept-Language, Accept-Encoding, etc., not just
+    User-Agent), and retries once on a connection-level failure (a
+    genuine HTTP error status like 403/503 is NOT retried -- that's a
+    real rejection, not a network blip, and retrying it identically
+    would just waste time).
+  - Every failed fetch (Arkan, OLX, both DuckDuckGo queries) is now
+    logged via Python's standard `logging` module -- this shows up in
+    Render's own log viewer, so if this happens again, the actual reason
+    (blocked/403, timed out, DNS failure, connection reset, etc.) is
+    right there instead of requiring more guesswork from a black box.
+  - search_arkan(), search_market(), and search_properties() all now
+    track whether ANYTHING was actually reachable, separately from
+    whether anything matched -- surfaced as a top-level
+    "search_unavailable" flag in search_properties()'s return value, so
+    the agent can tell the person the truth: "couldn't reach listing
+    sites right now, try again shortly" instead of implying an area has
+    no matching properties when the search never actually completed at
+    all. See agent/system_prompt.py for the matching reply guidance.
+
+If Render's logs (once this is deployed) show a real HTTP error like 403
+or 429 from OLX or Arkan specifically, that confirms IP-based bot-blocking
+rather than a code bug -- at that point the real fix is routing requests
+through a paid residential/rotating-IP proxy service (several exist
+specifically for this), not another tweak to this file. Worth knowing
+going in, so it isn't a surprise.
+
+DDG RESULTS THAT LAND ON A SEARCH/CATEGORY PAGE, NOT AN ACTUAL LISTING
+(fixed 2026-08-25)
+---------------------------------------------------------------------------
+The user was explicit: results need to land directly on the property, not
+on a site's own search page -- exactly the point of scraping real listing
+links instead of just handing back a portal search URL. Arkan and OLX
+already only ever produce direct listing-page URLs (that's what their own
+scrapers parse for). But the DuckDuckGo-sourced "other portals/open web"
+results are whatever a search engine happened to index for a given site,
+which occasionally is that site's own category/search page rather than one
+specific listing. _looks_like_listing_page() filters those out (a bare
+domain root, or a path containing an obvious non-listing marker like
+"/search", "/category/", "/tag/", or a search-style query string) before a
+DDG candidate is ever added to the pool -- a cheap, conservative check, not
+a guarantee, since there's no universal way to know a random third-party
+site's URL conventions for certain, but it catches the obvious cases.
 """
 
+import logging
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
@@ -156,11 +225,28 @@ from urllib.parse import urlparse
 import requests
 from bs4 import BeautifulSoup
 
+logger = logging.getLogger(__name__)
+
+# A fuller, more realistic browser header set than just User-Agent -- some
+# sites' basic bot-checks look at whether a request "looks like" a normal
+# browser navigation at all (Accept/Accept-Language/Accept-Encoding
+# present, etc.), not only the User-Agent string. This can't do anything
+# about a real IP-based block or a JS challenge (no amount of headers fixes
+# that -- see the module docstring's 2026-08-25 section), but it's a cheap,
+# real improvement against simpler checks.
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-    )
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
 }
 
 ARKAN_BASE = "https://arkanestate.com"
@@ -401,13 +487,38 @@ def _parse_arkan_cards(html, transaction_type, property_type,
     return results
 
 
-def _fetch(url, timeout=REQUEST_TIMEOUT):
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=timeout)
-        resp.raise_for_status()
-        return resp.text
-    except requests.RequestException:
-        return None
+def _fetch(url, timeout=REQUEST_TIMEOUT, retries=1):
+    """GETs a URL and returns its HTML text, or None on failure.
+
+    Retries once (no backoff -- the failed attempt already spent the full
+    timeout waiting) on a connection-level failure (timeout, DNS, connection
+    reset), since those are often transient on shared hosting. Does NOT
+    retry an HTTP-level error status (403/429/503, etc.) -- that's a real
+    server response actively rejecting the request, and an identical retry
+    won't change that, just waste time.
+
+    Every failure is logged via the standard `logging` module (so it shows
+    up in Render's own log viewer) instead of vanishing silently -- see the
+    module docstring's 2026-08-25 section for why this matters: a fetch
+    failing here with zero trace of why is exactly what made a real
+    production bug (real listings confirmed live on-site, zero results
+    coming back from this code) impossible to diagnose from the outside."""
+    attempts = retries + 1
+    for attempt in range(attempts):
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=timeout)
+            resp.raise_for_status()
+            return resp.text
+        except requests.HTTPError as e:
+            logger.info("Fetch got an HTTP error for %s: %s", url, e)
+            return None
+        except requests.RequestException as e:
+            if attempt + 1 < attempts:
+                continue
+            logger.warning(
+                "Fetch failed for %s after %d attempt(s): %s", url, attempts, e
+            )
+            return None
 
 
 def _resolve_bedrooms(candidates, bedrooms, cap=BEDROOM_DETAIL_FETCH_CAP):
@@ -533,9 +644,11 @@ def search_arkan(area, transaction_type="sale", property_type=None,
         "url": location_url or f"{ARKAN_BASE}/?s={area}",
         "results": candidates[:limit],
         "close_matches": close_matches[:limit],
+        "reached": fetched_any,
     }
     if not fetched_any:
         output["error"] = "Could not reach Arkan Estate's site just now."
+        logger.warning("Arkan: could not reach any page for area=%r", area)
     return output
 
 
@@ -623,27 +736,67 @@ def _parse_olx_cards(html, property_type, limit):
 
 
 def _scrape_olx_cards(url, property_type, limit):
-    """Fetches and parses one OLX category page. Never raises -- returns []
-    on any failure (timeout, block, markup change) so a slow/blocked page
-    degrades gracefully instead of breaking the whole reply. OLX's pages
-    are heavier than a plain WordPress page and occasionally slow or
-    anti-bot-guarded, so an empty result here doesn't necessarily mean no
-    listings exist -- that's exactly why "olx_search_url" is always handed
-    back to the user regardless."""
+    """Fetches and parses one OLX category page. Never raises -- returns
+    ([], False) on any failure (timeout, block, markup change) so a
+    slow/blocked page degrades gracefully instead of breaking the whole
+    reply. OLX's pages are heavier than a plain WordPress page and
+    occasionally slow or anti-bot-guarded, so an empty result here doesn't
+    necessarily mean no listings exist -- that's exactly why
+    "olx_search_url" is always handed back to the user regardless.
+
+    Returns (results, reached) -- `reached` is True as soon as the page
+    itself was actually fetched, even if 0 cards matched the requested
+    property_type filter, so callers can tell "OLX has nothing like that"
+    apart from "OLX couldn't be reached at all" (see search_market /
+    search_properties's "search_unavailable")."""
     html = _fetch(url, timeout=OLX_TIMEOUT)
     if not html:
-        return []
-    return _parse_olx_cards(html, property_type, limit)
+        logger.warning("OLX: could not reach %s", url)
+        return [], False
+    return _parse_olx_cards(html, property_type, limit), True
+
+
+NON_LISTING_PATH_MARKERS = (
+    "/search", "/category/", "/categories/", "/tag/", "/tags/", "/page/",
+)
+
+
+def _looks_like_listing_page(url):
+    """Conservative check that a URL looks like it lands on one specific
+    listing rather than a site's own search/category/directory page. Not a
+    guarantee (there's no universal way to know a random third-party site's
+    URL conventions for certain) -- just enough to catch the obvious cases
+    a search engine occasionally indexes instead of an individual listing
+    (a bare homepage, an obvious "/search"/"/category/"/"/tag/" path, or a
+    query string that's clearly a search box, e.g. "?s=" or "?q="). Added
+    2026-08-25 per explicit feedback: a result needs to land directly on
+    the property, not on a site's own search page -- the entire point of
+    scraping real listing links instead of handing back a portal search
+    URL."""
+    parsed = urlparse(url)
+    path = parsed.path.rstrip("/").lower()
+    if not path:
+        return False
+    if any(marker in path for marker in NON_LISTING_PATH_MARKERS):
+        return False
+    query = parsed.query.lower()
+    if query and ("s=" in query or "search=" in query or "q=" in query):
+        return False
+    return True
 
 
 def _ddg_search(query, limit):
-    """One query against DuckDuckGo's no-JS HTML endpoint. Returns a list of
-    {title, url, snippet} dicts, or an empty list on failure (never raises --
+    """One query against DuckDuckGo's no-JS HTML endpoint. Returns
+    (results, reached) -- `results` is a list of {title, url, snippet}
+    dicts (empty if nothing matched or the request failed), and `reached`
+    is True only if the request itself actually succeeded (never raises --
     a slow/blocked search engine should degrade gracefully, not break the
-    whole reply). Bedroom count is opportunistically read from the search
-    engine's own title/snippet text when it happens to be there for free;
-    when it isn't, search_market() fetches the listing's own page to check
-    (see DDG_BEDROOM_DETAIL_FETCH_CAP) the same way Arkan/OLX listings are
+    whole reply, but a failure here is now logged rather than silently
+    swallowed -- see module docstring's 2026-08-25 section). Bedroom count
+    is opportunistically read from the search engine's own title/snippet
+    text when it happens to be there for free; when it isn't,
+    search_market() fetches the listing's own page to check (see
+    DDG_BEDROOM_DETAIL_FETCH_CAP) the same way Arkan/OLX listings are
     confirmed -- a search engine snippet is usually too short/truncated to
     mention bedroom count even when the real listing page states it
     clearly (confirmed against a real Arkan listing the user linked
@@ -657,8 +810,9 @@ def _ddg_search(query, limit):
             timeout=REQUEST_TIMEOUT,
         )
         resp.raise_for_status()
-    except requests.RequestException:
-        return []
+    except requests.RequestException as e:
+        logger.info("DuckDuckGo search failed for query %r: %s", query, e)
+        return [], False
 
     soup = BeautifulSoup(resp.text, "html.parser")
     out = []
@@ -678,7 +832,7 @@ def _ddg_search(query, limit):
         if price is not None:
             item["price_usd"] = price
         out.append(item)
-    return out
+    return out, True
 
 
 def search_market(area, transaction_type="sale", property_type=None,
@@ -716,22 +870,26 @@ def search_market(area, transaction_type="sale", property_type=None,
         ddg_futures = {pool.submit(_ddg_search, q, limit * 2): q for q in ddg_queries}
 
         try:
-            olx_results = olx_future.result()
+            olx_results, olx_reached = olx_future.result()
         except Exception:  # noqa: BLE001 - a single source failing shouldn't sink the rest
-            olx_results = []
+            olx_results, olx_reached = [], False
 
         results_by_query = {}
+        reached_by_query = {}
         for future in as_completed(ddg_futures):
             q = ddg_futures[future]
             try:
-                results_by_query[q] = future.result()
+                results_by_query[q], reached_by_query[q] = future.result()
             except Exception:  # noqa: BLE001
-                results_by_query[q] = []
+                results_by_query[q], reached_by_query[q] = [], False
 
     # Flatten + dedupe the DDG-sourced candidates across both queries
     # (excluding Arkan/OLX -- those have their own dedicated scrapers)
     # before any bedroom confirmation, so the same listing's page never
-    # gets fetched twice.
+    # gets fetched twice. Also drops anything that looks like a
+    # search/category page rather than one specific listing (see
+    # _looks_like_listing_page) -- a result must land directly on the
+    # property, not on a site's own search page.
     ddg_candidates = []
     seen_ddg_urls = set()
     for query in ddg_queries:
@@ -741,8 +899,12 @@ def search_market(area, transaction_type="sale", property_type=None,
                 continue
             if item["url"] in seen_ddg_urls:
                 continue
+            if not _looks_like_listing_page(item["url"]):
+                continue
             seen_ddg_urls.add(item["url"])
             ddg_candidates.append(item)
+
+    any_reached = olx_reached or any(reached_by_query.values())
 
     olx_close = []
     ddg_close = []
@@ -802,11 +964,18 @@ def search_market(area, transaction_type="sale", property_type=None,
     for item in ddg_close:
         _add(item, close_matches)
 
+    if not any_reached:
+        logger.warning(
+            "search_market: could not reach OLX or either DuckDuckGo query "
+            "for area=%r", area,
+        )
+
     return {
         "olx_search_url": olx_search_url,
         "queries": ddg_queries,
         "results": merged[:limit],
         "close_matches": close_matches[:limit],
+        "reached": any_reached,
     }
 
 
@@ -943,6 +1112,7 @@ def search_properties(area, transaction_type="sale", property_type=None,
         arkan_out = arkan_future.result()
         market_out = market_future.result() if market_future is not None else {
             "results": [], "olx_search_url": None, "close_matches": [],
+            "reached": False,
         }
 
     seen_keys = set()
@@ -979,10 +1149,35 @@ def search_properties(area, transaction_type="sale", property_type=None,
             bedrooms, min_price, max_price, limit, _add,
         )
 
-    return {
+    # True only if EVERY source this call actually tried (Arkan, and OLX +
+    # both DuckDuckGo queries when include_public_sources is on) failed to
+    # even be reached -- a completely different situation from a
+    # successful search that genuinely found nothing (see module
+    # docstring's 2026-08-25 section, and agent/system_prompt.py for the
+    # matching reply guidance). Never confuse the two: this flag being
+    # true means the search never actually completed, so there is no
+    # basis to say "no matching properties" -- we simply don't know yet.
+    search_unavailable = not (
+        arkan_out.get("reached", False) or market_out.get("reached", False)
+    )
+
+    output = {
         "results": merged,
         "olx_search_url": market_out.get("olx_search_url"),
+        "search_unavailable": search_unavailable,
     }
+    if search_unavailable:
+        logger.warning(
+            "search_properties: every source failed for area=%r -- "
+            "search_unavailable=True", area,
+        )
+        output["note"] = (
+            "Could not reach any listing sites just now -- this is almost "
+            "always a temporary network issue, not proof the area has no "
+            "properties. Say so honestly and suggest trying again shortly; "
+            "do not say or imply that no matching properties exist."
+        )
+    return output
 
 
 if __name__ == "__main__":
