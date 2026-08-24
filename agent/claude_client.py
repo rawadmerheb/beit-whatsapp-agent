@@ -25,13 +25,23 @@ from .system_prompt import SYSTEM_PROMPT
 
 client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
-# gemini-3.6-flash: fast, capable, and on Google's free tier (no credit
-# card needed). See https://ai.google.dev/gemini-api/docs/models -- Google
-# periodically retires older free-tier models (gemini-2.5-flash was retired
-# for new users in 2026), so if this ever starts returning a 404 "model no
-# longer available" error, check that page for the current model name and
-# update this default (and the GEMINI_MODEL env var, if you've set one).
-MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+# gemini-3.5-flash-lite: same tool-calling/thinking features as the full
+# "flash" models, and on Google's free tier (no credit card needed) --
+# chosen over gemini-3.6-flash specifically because the full "flash" tier's
+# free daily quota is very low (20 requests/day at time of writing, which a
+# single pilot user can burn through in minutes since each tool-using
+# message costs 2 requests). "flash-lite" variants consistently get a much
+# more generous free allowance. See https://ai.google.dev/gemini-api/docs/models
+# for the current model lineup, and https://aistudio.google.com/rate-limit
+# (while logged into the account that owns GEMINI_API_KEY) for this
+# project's actual live quota numbers. Google periodically retires older
+# free-tier models (gemini-2.5-flash was retired for new users in 2026), so
+# if this ever starts returning a 404 "model no longer available" error,
+# check the models page for the current name and update this default (and
+# the GEMINI_MODEL env var, if you've set one). If you ever hit a 429
+# RESOURCE_EXHAUSTED error again, that's this same daily-quota wall --
+# either wait for it to reset or switch to a model with more free headroom.
+MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
 SEARCH_PROPERTIES_FN = types.FunctionDeclaration(
     name="search_properties",
@@ -149,7 +159,15 @@ def ask_agent(user_text, history=None, max_tool_rounds=4):
             )
             for call in calls
         ]
-        contents.append(types.Content(role="tool", parts=response_parts))
+        # IMPORTANT: this must be role="user", not role="tool"/"function".
+        # Gemini's API rejects role="tool" outright with a 400
+        # INVALID_ARGUMENT ("Role 'tool' is not supported") -- its role
+        # vocabulary only has SYSTEM/USER/MODEL/etc, no separate tool role.
+        # A FunctionResponse being sent back to the model is, from the
+        # API's point of view, just another "user" turn (the model's own
+        # function-call turn already came back with role="model" via
+        # response.candidates[0].content above).
+        contents.append(types.Content(role="user", parts=response_parts))
 
     return (
         "That search is taking more steps than expected -- can you narrow it down "
