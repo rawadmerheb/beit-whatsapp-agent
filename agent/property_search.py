@@ -514,13 +514,76 @@ Banker, Cushman & Wakefield, Savills, Knight Frank, JLL) turned up a real,
 working Lebanon-specific website -- only RE/MAX did, via its Tripoli
 franchise site. Better to under-promise here than add a domain that turns
 out to be dead weight the moment it's queried.
+
+"A LOGO ISN'T A THUMBNAIL" AND "WHY STILL SO FEW RESULTS?" (2026-08-30)
+---------------------------------------------------------------------------
+Two real bugs the user's next test surfaced, both confirmed live rather
+than guessed at:
+
+1. A "JSK BROKERAGE" logo graphic rendered as a listing's thumbnail. Fetched
+   two real jskre.com pages to find out why: the homepage's own og:image is
+   literally that logo (jskre.com/images/og-image.png), and even a genuine
+   individual listing page can carry a generic stand-in image -- one real
+   listing's og:image was ".../RES%20SALE.jpg", the CRM's (Propertybase, an
+   S3-hosted real estate CRM several agencies here run on) own generic
+   "Residential Sale" placeholder for a listing that never had a real photo
+   uploaded, not a photo of that unit. A different listing on the same site,
+   fetched the same way, had a genuinely listing-specific opaque filename
+   instead. og:image was never a safe universal signal -- it can be site
+   branding or a shared placeholder as easily as a real photo. Fixed with a
+   GENERIC_IMAGE_MARKERS deny-list (_looks_generic_image) that rejects an
+   og:image/twitter:image value that looks like branding or a shared
+   placeholder rather than a specific listing's own photo, plus a second-
+   chance fallback (_extract_body_image) that scans the page's own body
+   content (header/nav/footer stripped out first) for a real-looking <img>
+   when the meta tags come up empty or all rejected. Both are wrapped in one
+   entry point, _extract_thumbnail(), which both call sites now use. A
+   missing thumbnail is a much smaller problem than a wrong one, so nothing
+   here ever guesses -- it returns None rather than fall back to something
+   generic.
+
+2. Results still felt "very limited" despite the 32-site expansion. Two
+   compounding causes, found by reading the actual request/response path
+   rather than assuming the portal list was still the bottleneck:
+   - _serper_search() was building its request body as just {"q": query} --
+     it never actually told Serper's API how many results to return. Serper
+     silently defaults to ~10 organic results per query when "num" isn't
+     sent, so the `[:limit]` slice immediately after looked like it
+     controlled result count but never did anything past the first ~10 --
+     there was nothing more in the response for it to slice, no matter how
+     big a `limit` this code asked for internally. Every one of
+     search_market()'s chunked queries was quietly capped at ~10 raw hits
+     this way. Fixed by explicitly sending "num" (confirmed via Serper's own
+     documented credit rule: up to 10 results costs 1 credit, 11-100 costs a
+     flat 2 credits -- not per-result -- so once a query needs more than 10,
+     there's no reason to ask for fewer than 100, Serper's own max).
+   - search_properties() computed `reservoir_limit` (limit +
+     RESULT_RESERVOIR_BUFFER, meant to give _finalize_and_enrich() real
+     spare candidates to backfill from when some get dropped as dead pages)
+     but then called search_arkan() and search_market() with the bare
+     `limit` instead -- and both of those functions truncate their OWN
+     "results"/"close_matches" to whatever limit they're handed before ever
+     returning. So the reservoir buffer's "spares" never existed in the
+     first place: the two sources feeding it were already capped at the
+     final count before ranking even began. Fixed by computing
+     `reservoir_limit` before calling either function and passing that
+     instead of the bare `limit`.
+   Together: previously, a search's real candidate ceiling was roughly
+   "~10 per source, some of which get dropped as dead links" -- now each
+   source can return up to `limit + RESULT_RESERVOIR_BUFFER` real
+   candidates, and Serper-backed queries actually retrieve up to 100
+   results instead of a silent ~10. This roughly doubles the Serper credit
+   cost per search (queries that fell in the 1-credit bracket now use the
+   2-credit bracket) -- still a few thousandths of a cent per search on
+   Serper's published per-1,000-query pricing, and well within the 2,500
+   free queries the account starts with.
 """
 
 import logging
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, unquote
 
 import requests
 from bs4 import BeautifulSoup
@@ -1104,6 +1167,55 @@ def _fetch(url, timeout=REQUEST_TIMEOUT, retries=1, render=False):
             return None
 
 
+# Added 2026-08-30: og:image is NOT reliably a photo of the specific
+# listing it's read from -- confirmed against two real, live jskre.com
+# pages the user's own screenshot led back to. The site's homepage sets
+# og:image to its own logo (jskre.com/images/og-image.png -- literally
+# the "JSK BROKERAGE" graphic the user spotted standing in for a
+# thumbnail). And even a genuine individual listing page can carry a
+# generic stand-in image: one real JSK listing's og:image was
+# ".../RES%20SALE.jpg" -- "RES SALE" being the CRM's (Propertybase, an
+# S3-hosted real estate CRM several agencies here run on) own generic
+# "Residential Sale" placeholder, used whenever that specific listing
+# never had a real photo uploaded to it -- not a photo of that unit.
+# A genuinely listing-specific photo, confirmed on a different JSK
+# listing fetched the same way, instead has an opaque per-upload
+# filename (c7c7545d-0d03-4137-b425-7acfe38e684d.jpeg) with no generic
+# wording anywhere in it. GENERIC_IMAGE_MARKERS is a deny-list of
+# path/filename substrings that flag an image URL as site-wide branding
+# or a shared placeholder rather than a specific listing's own photo.
+# Checked against the URL percent-decoded and lowercased, so
+# "RES%20SALE" and "res-sale" both match the same "res sale" entry.
+GENERIC_IMAGE_MARKERS = (
+    "og-image", "og_image", "og image",
+    "logo",
+    "brand", "branding",
+    "placeholder",
+    "no-image", "no_image", "no image", "noimage",
+    "no-photo", "no_photo", "no photo", "nophoto",
+    "coming-soon", "coming_soon", "coming soon",
+    "default-image", "default_image", "default photo",
+    "share-image", "share_image", "share image",
+    "social-image", "social_image", "social image",
+    "res-sale", "res_sale", "res sale", "ressale",
+    "res-rent", "res_rent", "res rent", "resrent",
+    "watermark",
+)
+
+
+def _looks_generic_image(url):
+    """Is this image URL site-wide branding or a shared CRM/category
+    placeholder rather than an actual listing photo? See
+    GENERIC_IMAGE_MARKERS above -- confirmed against real fetched pages,
+    not guessed. A hit here means the image gets dropped rather than
+    shown: a missing thumbnail is a much smaller problem for a real
+    estate app than an agency's logo standing in for a listing photo."""
+    if not url:
+        return False
+    decoded = unquote(url).lower()
+    return any(marker in decoded for marker in GENERIC_IMAGE_MARKERS)
+
+
 def _extract_og_image(html, base_url):
     """Pulls a thumbnail image URL out of a fetched page's Open Graph /
     Twitter Card meta tags. Confirmed 2026-08-28 via a real fetch of a
@@ -1111,8 +1223,10 @@ def _extract_og_image(html, base_url):
     (including ones this code has no custom parser for) already exposes a
     representative photo -- built for link-preview purposes, but works
     just as well here, and is far more reliable than guessing each site's
-    own card-image markup. Returns an absolute URL, or None if no such tag
-    is present."""
+    own card-image markup. Skips (rather than returns) a tag whose value
+    looks generic -- see _looks_generic_image -- since a shared logo/
+    placeholder is worse than no thumbnail at all. Returns an absolute
+    URL, or None if no real, listing-specific tag is present."""
     if not html:
         return None
     soup = BeautifulSoup(html, "html.parser")
@@ -1124,9 +1238,53 @@ def _extract_og_image(html, base_url):
     ):
         tag = soup.find("meta", attrs=attrs)
         content = tag.get("content") if tag else None
-        if content and content.strip():
+        if content and content.strip() and not _looks_generic_image(content):
             return urljoin(base_url, content.strip())
     return None
+
+
+def _extract_body_image(html, base_url):
+    """Second-chance thumbnail extraction for when a page's own og:image/
+    twitter:image tags are missing or every one of them looked generic
+    (see _extract_og_image/_looks_generic_image) -- scans the page's own
+    body content, with <header>/<nav>/<footer> stripped out first (that's
+    where a site's logo and nav icons live, not a listing's own photos),
+    for the first real-looking <img>. Prefers lazy-load attributes
+    (data-src etc, same reasoning as _extract_card_image) over a plain
+    src, since many sites only populate src with a placeholder until JS
+    runs. Returns None rather than guess when nothing clean turns up."""
+    if not html:
+        return None
+    soup = BeautifulSoup(html, "html.parser")
+    for tag_name in ("header", "nav", "footer"):
+        for tag in soup.find_all(tag_name):
+            tag.decompose()
+    for img in soup.find_all("img"):
+        for attr in ("data-src", "data-lazy-src", "data-original", "src"):
+            value = img.get(attr)
+            if not value or not value.strip():
+                continue
+            value = value.strip()
+            if value.startswith("data:"):
+                continue
+            if _looks_generic_image(value):
+                continue
+            if not re.search(r"\.(jpe?g|png|webp)(\?|$)", value, re.IGNORECASE):
+                continue
+            return urljoin(base_url, value)
+    return None
+
+
+def _extract_thumbnail(html, base_url):
+    """Single entry point callers should use to get a listing's thumbnail
+    from a fetched detail page: tries the reliable, cross-site og:image/
+    twitter:image route first (_extract_og_image, itself already
+    filtering out generic/branding images), then falls back to scanning
+    the page's own body content directly (_extract_body_image) when that
+    comes up empty -- no extra fetch either way, since `html` is already
+    in hand. Returns None (never a guess) if neither turns up a real,
+    listing-specific photo."""
+    return _extract_og_image(html, base_url) or _extract_body_image(html, base_url)
 
 
 # A real listing page always has a meaningful amount of actual body text
@@ -1245,7 +1403,7 @@ def _resolve_bedrooms(candidates, bedrooms, cap=BEDROOM_DETAIL_FETCH_CAP):
             # blank page (see _looks_dead_page, and the module docstring's
             # 2026-08-28 section for the real confidencerealestate.com
             # example that motivated this) and to grab a thumbnail image
-            # (see _extract_og_image) while the HTML is already in hand.
+            # (see _extract_thumbnail) while the HTML is already in hand.
             # A dead-looking page is dropped entirely, not just marked
             # unconfirmed -- a fetch that failed outright, or a page this
             # broken, isn't something to ever hand to the person as a real
@@ -1269,9 +1427,9 @@ def _resolve_bedrooms(candidates, bedrooms, cap=BEDROOM_DETAIL_FETCH_CAP):
                 if detail_price:
                     item["price_usd"] = detail_price
             if not item.get("image_url"):
-                og_image = _extract_og_image(html, item["url"])
-                if og_image:
-                    item["image_url"] = og_image
+                thumbnail = _extract_thumbnail(html, item["url"])
+                if thumbnail:
+                    item["image_url"] = thumbnail
             if item.get("days_old") is None:
                 detail_days_old = _extract_days_old(page_text)
                 if detail_days_old is not None:
@@ -1660,11 +1818,33 @@ def _serper_search(query, limit):
     confirmed in production), which no amount of retrying or better
     headers can fix, since the connection itself never completes. Returns
     (results, reached) in the same shape _ddg_search() returns, so
-    search_market() doesn't need to know or care which one actually ran."""
+    search_market() doesn't need to know or care which one actually ran.
+
+    Added 2026-08-30: explicitly sends Serper's own "num" field now.
+    Before this, the request body only ever sent {"q": query} -- Serper
+    was never told how many results to return, so it quietly defaulted
+    to its own standard ~10 organic results per query no matter how big
+    a `limit` this function was called with. The `[:limit]` slice below
+    looked like it controlled result count, but it never actually did
+    anything past the first ~10 -- there was nothing more in `data`
+    for it to slice. Since every query this project runs (see
+    search_market's chunked OTHER_KNOWN_PORTALS queries) was silently
+    capped at ~10 raw hits this way, this was very likely the single
+    biggest reason results still felt "very limited" even after the
+    30+ -site expansion and the reservoir buffer (RESULT_RESERVOIR_BUFFER)
+    -- both of those only ever had ~10 real candidates per query to work
+    with, regardless of how much bigger a number was asked for. Confirmed
+    via Serper's own documented credit rule (2026-08-30 research): a
+    query for up to 10 results costs 1 credit; 11-100 costs a flat 2
+    credits -- not a per-result cost -- so once a query needs more than
+    10, there's no reason to ask for fewer than 100 (Serper's own max)."""
+    payload = {"q": query}
+    if limit > 10:
+        payload["num"] = min(limit, 100)
     try:
         resp = requests.post(
             SERPER_ENDPOINT,
-            json={"q": query},
+            json=payload,
             headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
             timeout=REQUEST_TIMEOUT,
         )
@@ -2024,9 +2204,9 @@ def _finalize_and_enrich(ranked_candidates, limit):
                 )
                 continue
             if not item.get("image_url"):
-                og_image = _extract_og_image(html, item["url"])
-                if og_image:
-                    item["image_url"] = og_image
+                thumbnail = _extract_thumbnail(html, item["url"])
+                if thumbnail:
+                    item["image_url"] = thumbnail
             if item.get("days_old") is None:
                 page_text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
                 detail_days_old = _extract_days_old(page_text)
@@ -2071,16 +2251,35 @@ def search_properties(area, transaction_type="sale", property_type=None,
 
     Pass include_public_sources=False to search Arkan's site alone.
     """
+    # Added 2026-08-30: computed BEFORE calling search_arkan()/
+    # search_market() now (it used to only exist further down, after
+    # those calls had already returned), and passed to them below instead
+    # of the bare `limit`. This was a real bug: search_arkan() and
+    # search_market() each truncate their OWN "results"/"close_matches"
+    # to whatever `limit` they were called with (see their own
+    # `candidates[:limit]` / `merged[:limit]`) before ever handing
+    # anything back here. Calling them with the plain `limit` (10) meant
+    # the reservoir buffer below (_rank_and_fill asking for
+    # `reservoir_limit` candidates so _finalize_and_enrich has real
+    # spares to backfill from -- see RESULT_RESERVOIR_BUFFER) never
+    # actually had more than ~`limit` candidates per source to draw
+    # from in the first place -- the "spare" pool the whole reservoir
+    # design depends on didn't exist yet at the point these two were
+    # called. Passing `reservoir_limit` here instead means each source
+    # itself returns up to `limit + RESULT_RESERVOIR_BUFFER` candidates,
+    # so there are real spares once dead pages get dropped further down.
+    reservoir_limit = limit + RESULT_RESERVOIR_BUFFER
+
     with ThreadPoolExecutor(max_workers=2) as pool:
         arkan_future = pool.submit(
             search_arkan, area, transaction_type, property_type,
-            min_price, max_price, bedrooms, limit,
+            min_price, max_price, bedrooms, reservoir_limit,
         )
         market_future = None
         if include_public_sources:
             market_future = pool.submit(
                 search_market, area, transaction_type, property_type,
-                bedrooms, limit,
+                bedrooms, reservoir_limit,
             )
 
         arkan_out = arkan_future.result()
@@ -2105,13 +2304,12 @@ def search_properties(area, transaction_type="sale", property_type=None,
         bucket.append(item)
         return True
 
-    # Asked for more than `limit` here (see RESULT_RESERVOIR_BUFFER) so
-    # _finalize_and_enrich() below has real, already-ranked spares to pull
-    # from if it has to drop a candidate whose own page turns out to be
-    # broken -- still ranked best-first throughout, so a spare only ever
-    # backfills a dropped slot, never bumps ahead of a better result.
-    reservoir_limit = limit + RESULT_RESERVOIR_BUFFER
-
+    # `reservoir_limit` was already computed above (before search_arkan()/
+    # search_market() were called, so it could be passed to them too) --
+    # still exactly what it was before: `limit` plus RESULT_RESERVOIR_BUFFER
+    # of real spares for _finalize_and_enrich() below to pull from if a
+    # candidate's own page turns out to be broken, without ever bumping a
+    # spare ahead of a genuinely better-ranked result.
     merged = []
     _rank_and_fill(
         merged, arkan_out.get("results", []), market_out.get("results", []),
