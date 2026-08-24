@@ -99,7 +99,11 @@ def api_chat():
     audio_file = request.files.get("audio")
     if audio_file and audio_file.filename:
         is_voice_input = True
-        local_path = os.path.join(AUDIO_DIR, f"web_in_{uuid.uuid4().hex}")
+        # Keep the browser's file extension (chat.html always sends
+        # "recording.webm") so ffmpeg has an explicit hint about the
+        # container format instead of relying entirely on content-sniffing.
+        ext = os.path.splitext(audio_file.filename)[1] or ".webm"
+        local_path = os.path.join(AUDIO_DIR, f"web_in_{uuid.uuid4().hex}{ext}")
         audio_file.save(local_path)
         try:
             user_text, _lang = transcribe(local_path)
