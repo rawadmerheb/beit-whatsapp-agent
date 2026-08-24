@@ -79,6 +79,24 @@ search URL is still built and handed back as "olx_search_url" -- it's a
 perfectly good link for someone to keep browsing themselves, just not
 relied on as the only way individual listings get found.
 
+Third: the user then pointed at a specific live Arkan listing
+(a 210 sqm Amchit apartment) as proof of the underlying principle -- its
+own page plainly states "3 Bedrooms" / "Bedrooms: 3" in the description,
+exactly the kind of detail a compact search-card teaser or a search
+engine's result snippet routinely leaves out, and said the same applies
+"on all websites." That's exactly right, and it was only half-generalized:
+Arkan and OLX candidates both already got their own detail page read when
+their teaser said nothing, but results from the "other portals/open web"
+DuckDuckGo queries in search_market() did NOT -- they only got an
+opportunistic, best-effort check of the search engine's own snippet text,
+which is short and usually doesn't mention bedroom count at all. Fixed by
+applying the same _resolve_bedrooms() detail-page confirmation to those
+DDG-sourced candidates too (capped lower than Arkan/OLX's, via
+DDG_BEDROOM_DETAIL_FETCH_CAP, since these are arbitrary third-party sites
+rather than two known, previously-profiled ones) -- so a bedroom count now
+gets confirmed by reading the actual listing wherever it's hosted, not
+just on the two sites this code knows the layout of.
+
 ON "ALL AGENCIES AND BROKERS IN LEBANON" (AND "GOOGLE")
 --------------------------------------------------------
 There is no single directory or API covering every Lebanese real estate
@@ -104,10 +122,31 @@ brokers, and portals -- `search_market()` also runs two DuckDuckGo queries
 (OTHER_KNOWN_PORTALS), one fully open (no site filter) so whichever
 agency/broker/portal is indexed for that search shows up regardless of any
 curated list. Both run concurrently with the direct OLX scrape.
+OTHER_KNOWN_PORTALS was expanded 2026-08-24 with a batch of specific
+Lebanese sites the user pulled from their own Google search (Confidence
+Real Estate, JSK Real Estate, Trust Lebanon Agency, Century 21 Lebanon,
+3akarat.net, BluSky Properties) -- each gets the same site: filtered
+DuckDuckGo query treatment as the original four, and (since that's already
+generalized -- see the bedroom-count section above) the same
+detail-page bedroom/price confirmation as everything else DDG turns up.
 
 If you ever want genuine Google-branded results badly enough to accept a
 paid API down the line, see README "Optional: real Google search results"
 for how to wire in a service like Serper.dev.
+
+RANKING: "TOP 10" MEANS BEST-FIRST, NOT JUST FIRST-FOUND (added 2026-08-24)
+----------------------------------------------------------------------------
+Originally, search_properties() just interleaved Arkan's and the market's
+results round-robin -- fine for "don't favor one source," but it meant the
+first 10 results were whichever 10 happened to come back first, not
+necessarily the best 10. The user asked for the top 10 to actually be
+ranked by newly listed, pricing, features, and how well each one matches
+the request. _score_result() scores every candidate on exactly those four
+things (see its own docstring for the detail), and _rank_and_fill() sorts
+the combined pool by that score before taking the top `limit` -- still
+completely blind to which site a result came from, so this doesn't
+reintroduce source favoritism, it just stops treating "arrived first" as
+"best."
 """
 
 import re
@@ -191,12 +230,24 @@ OLX_LISTING_HREF_RE = re.compile(r"/ad/[^/\s\"'?]+-ID[0-9A-Za-z]+\.html")
 
 # The rest of the curated Lebanese listing portals worth always checking
 # explicitly, in addition to the unrestricted search below. Add more here as
-# you find ones worth including.
+# you find ones worth including. Expanded 2026-08-24 with a batch the user
+# pulled straight from their own Google search for real estate sites in
+# Lebanon -- these are indexed, live sites the same way the original four
+# were confirmed, just checked via the site: filter below rather than a
+# bespoke scraper each (see module docstring). Left out: yelleb.com, which
+# in that same search is itself a directory/"top 10 lists" site rather than
+# a portal with its own individual listings -- nothing to search inside.
 OTHER_KNOWN_PORTALS = [
     "realestate.com.lb",
     "byootna.com",
     "lebanon.dubizzle.com",
     "lebanon.realigro.com",
+    "confidencerealestate.com",
+    "jskre.com",
+    "trustlebanonagency.com",
+    "century21.com.lb",
+    "3akarat.net",
+    "blusky-properties.com",
 ]
 
 # Per-request timeout for Arkan and the DuckDuckGo queries. Kept modest
@@ -212,6 +263,11 @@ OLX_TIMEOUT = 14
 # latency (these run concurrently, but still cost real time). Applied
 # separately per source (Arkan, OLX).
 BEDROOM_DETAIL_FETCH_CAP = 12
+# Same idea, applied to results from the long-tail "other portals/open web"
+# DuckDuckGo search -- kept lower than the Arkan/OLX cap since these are
+# arbitrary third-party sites (slower/less predictable to fetch) and this
+# pass runs on top of, not instead of, Arkan+OLX's own checks.
+DDG_BEDROOM_DETAIL_FETCH_CAP = 6
 
 
 def _slugify(text):
@@ -399,6 +455,14 @@ def _resolve_bedrooms(candidates, bedrooms, cap=BEDROOM_DETAIL_FETCH_CAP):
             if html:
                 page_text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
                 confirmed = _extract_bedroom_count(page_text)
+                # Free bonus while the page is already open: fill in price
+                # too if this candidate didn't have one yet (common for
+                # DuckDuckGo-sourced items, whose search snippet rarely
+                # states it) -- used for ranking (see _score_result).
+                if not item.get("price_usd"):
+                    detail_price = _clean_price(page_text)
+                    if detail_price:
+                        item["price_usd"] = detail_price
             if confirmed is not None:
                 item["bedrooms"] = confirmed
             (matched if confirmed == bedrooms else close_matches).append(item)
@@ -577,10 +641,14 @@ def _ddg_search(query, limit):
     {title, url, snippet} dicts, or an empty list on failure (never raises --
     a slow/blocked search engine should degrade gracefully, not break the
     whole reply). Bedroom count is opportunistically read from the search
-    engine's own title/snippet text when it happens to be there (best
-    effort only -- unlike Arkan/OLX, there's no listing page of our own to
-    fall back and check, so a miss here just means an absent "bedrooms"
-    field, not an incorrect one)."""
+    engine's own title/snippet text when it happens to be there for free;
+    when it isn't, search_market() fetches the listing's own page to check
+    (see DDG_BEDROOM_DETAIL_FETCH_CAP) the same way Arkan/OLX listings are
+    confirmed -- a search engine snippet is usually too short/truncated to
+    mention bedroom count even when the real listing page states it
+    clearly (confirmed against a real Arkan listing the user linked
+    directly: its own page plainly says "3 Bedrooms" / "Bedrooms: 3", the
+    kind of detail a card teaser or search snippet routinely omits)."""
     try:
         resp = requests.post(
             "https://html.duckduckgo.com/html/",
@@ -602,9 +670,13 @@ def _ddg_search(query, limit):
         title = link_tag.get_text(strip=True)
         snippet = snippet_tag.get_text(strip=True) if snippet_tag else ""
         item = {"title": title, "url": link_tag.get("href"), "snippet": snippet}
-        bedrooms_hint = _extract_bedroom_count(f"{title} {snippet}")
+        combined_text = f"{title} {snippet}"
+        bedrooms_hint = _extract_bedroom_count(combined_text)
         if bedrooms_hint is not None:
             item["bedrooms"] = bedrooms_hint
+        price = _clean_price(combined_text)
+        if price is not None:
+            item["price_usd"] = price
         out.append(item)
     return out
 
@@ -617,10 +689,16 @@ def search_market(area, transaction_type="sale", property_type=None,
     All three run concurrently and are merged, deduped by domain+path.
     Always includes "olx_search_url" -- a live, correctly filtered OLX
     link -- even when nothing was scraped. When a bedroom count is
-    requested, OLX candidates are confirmed/split into "results" and a
-    "close_matches" fallback pool the same way Arkan's are (see
-    _resolve_bedrooms + module docstring on why OLX's own keyword search
-    isn't relied on for this). (Arkan itself is searched separately by
+    requested, EVERY candidate -- OLX and the other-portals/open-web
+    DuckDuckGo results alike -- gets the same real confirmation Arkan's
+    listings get: a card/snippet that already states it is resolved for
+    free, and anything else has its own listing page fetched and read (see
+    _resolve_bedrooms, and DDG_BEDROOM_DETAIL_FETCH_CAP for the smaller cap
+    used on these arbitrary third-party sites), split into "results" and a
+    "close_matches" fallback pool. This is what "read inside the property"
+    means applied to every source, not just Arkan's own site -- a search
+    engine snippet or a portal's summary card mentioning a bedroom count is
+    the exception, not the rule. (Arkan itself is searched separately by
     search_arkan() and merged in by search_properties() -- this function
     is everything else.)"""
     kind = "for sale" if transaction_type != "rent" else "for rent"
@@ -635,7 +713,7 @@ def search_market(area, transaction_type="sale", property_type=None,
 
     with ThreadPoolExecutor(max_workers=len(ddg_queries) + 1) as pool:
         olx_future = pool.submit(_scrape_olx_cards, olx_scrape_url, property_type, limit * 3)
-        ddg_futures = {pool.submit(_ddg_search, q, limit): q for q in ddg_queries}
+        ddg_futures = {pool.submit(_ddg_search, q, limit * 2): q for q in ddg_queries}
 
         try:
             olx_results = olx_future.result()
@@ -650,9 +728,40 @@ def search_market(area, transaction_type="sale", property_type=None,
             except Exception:  # noqa: BLE001
                 results_by_query[q] = []
 
+    # Flatten + dedupe the DDG-sourced candidates across both queries
+    # (excluding Arkan/OLX -- those have their own dedicated scrapers)
+    # before any bedroom confirmation, so the same listing's page never
+    # gets fetched twice.
+    ddg_candidates = []
+    seen_ddg_urls = set()
+    for query in ddg_queries:
+        for item in results_by_query.get(query, []):
+            domain = urlparse(item["url"]).netloc.lower()
+            if "arkanestate.com" in domain or "olx.com.lb" in domain:
+                continue
+            if item["url"] in seen_ddg_urls:
+                continue
+            seen_ddg_urls.add(item["url"])
+            ddg_candidates.append(item)
+
     olx_close = []
+    ddg_close = []
     if bedrooms:
-        olx_results, olx_close = _resolve_bedrooms(olx_results, bedrooms)
+        # A DDG item may already carry an opportunistic "bedrooms" field
+        # from its own snippet text (see _ddg_search) -- treat that the
+        # same as a card teaser hint so it's resolved for free instead of
+        # re-fetched. OLX and DDG are resolved concurrently with each
+        # other (each still fetches its own ambiguous candidates'
+        # detail pages concurrently internally).
+        for item in ddg_candidates:
+            item["bedrooms_hint"] = item.pop("bedrooms", None)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            olx_future = pool.submit(_resolve_bedrooms, olx_results, bedrooms)
+            ddg_future = pool.submit(
+                _resolve_bedrooms, ddg_candidates, bedrooms, DDG_BEDROOM_DETAIL_FETCH_CAP,
+            )
+            olx_results, olx_close = olx_future.result()
+            ddg_candidates, ddg_close = ddg_future.result()
     else:
         for item in olx_results:
             hint = item.pop("bedrooms_hint", None)
@@ -679,22 +788,18 @@ def search_market(area, transaction_type="sale", property_type=None,
     for item in olx_results:
         _add(item, merged)
 
-    for query in ddg_queries:
+    for item in ddg_candidates:
         if len(merged) >= limit:
             break
-        for item in results_by_query.get(query, []):
-            domain = urlparse(item["url"]).netloc.lower()
-            if "arkanestate.com" in domain or "olx.com.lb" in domain:
-                continue
-            if len(merged) >= limit:
-                break
-            # Dedupe by the URL itself (ignoring query string/fragment and a
-            # trailing slash) -- the same listing can turn up more than
-            # once, and a URL match is a more reliable "same listing"
-            # signal than title text, which repeats across many listings.
-            _add(item, merged)
+        # Dedupe by the URL itself (ignoring query string/fragment and a
+        # trailing slash) -- the same listing can turn up more than once,
+        # and a URL match is a more reliable "same listing" signal than
+        # title text, which repeats across many listings.
+        _add(item, merged)
 
     for item in olx_close:
+        _add(item, close_matches)
+    for item in ddg_close:
         _add(item, close_matches)
 
     return {
@@ -705,17 +810,112 @@ def search_market(area, transaction_type="sale", property_type=None,
     }
 
 
+# Keywords that make a listing more attractive/informative when they show
+# up in its own title/snippet -- a lightweight, transparent stand-in for
+# "features" as a ranking input. Deliberately generic (not tied to any one
+# site's markup), so it works the same for Arkan, OLX, or any other portal.
+FEATURE_KEYWORDS = [
+    "garden", "parking", "maid room", "sea view", "mountain view", "view",
+    "furnished", "renovated", "new building", "balcony", "terrace", "pool",
+    "elevator", "generator", "storage", "duplex", "rooftop", "open view",
+]
+
+
+def _feature_score(item):
+    text = f"{item.get('title', '')} {item.get('snippet', '')}".lower()
+    return sum(1 for kw in FEATURE_KEYWORDS if kw in text)
+
+
+def _score_result(item, index_in_source, bedrooms, min_price, max_price):
+    """Ranks a single result on the 4 things that actually make one listing
+    a better answer than another -- never on which site it came from (no
+    site, including Arkan, gets a boost just for being itself):
+
+    - matching request: an exact bedroom match outranks a different
+      confirmed count, which outranks one that's still unconfirmed (see
+      _resolve_bedrooms's "bedrooms" field); price inside the requested
+      budget is rewarded, price confirmed to be outside it is penalized.
+    - newly listed: each source's own results already come back in that
+      source's newest-first order (Arkan/OLX's own archive pages, in
+      particular, are natively newest-first -- see module docstring), so a
+      candidate's position within its own source's list is used as a
+      recency proxy. No site here exposes a reliably parseable exact
+      listing date across the board, so this is an honest proxy, not a
+      fabricated timestamp.
+    - pricing: a listing with a confirmed price outranks one where price
+      is simply unknown -- "unknown" isn't "cheap", it's missing data.
+    - features: a richer, more informative description (see
+      FEATURE_KEYWORDS) edges out a bare-bones one when everything else
+      about two listings is equal.
+    """
+    score = 0.0
+
+    if bedrooms:
+        if item.get("bedrooms") == bedrooms:
+            score += 100.0  # matching request: exact bedroom match
+        elif "bedrooms" in item:
+            score += 40.0   # a different, but confirmed, bedroom count
+        else:
+            score += 20.0   # bedroom count never got confirmed
+    else:
+        score += 60.0
+
+    score += max(0.0, 20.0 - index_in_source)  # newly listed (proxy)
+
+    price = item.get("price_usd")
+    if price:
+        score += 10.0  # pricing: known beats unknown
+        if min_price and price < min_price:
+            score -= 15.0
+        if max_price and price > max_price:
+            score -= 15.0
+
+    score += min(_feature_score(item), 5)  # features
+
+    return score
+
+
+def _rank_and_fill(pool, arkan_items, market_items, bedrooms, min_price,
+                    max_price, limit, add_fn):
+    """Scores a combined Arkan+market candidate pool by _score_result() and
+    adds the best ones to `pool` (via add_fn, which also dedupes) until it
+    reaches `limit`. Interleaves Arkan/market before scoring (rather than
+    concatenating one after the other) purely so that an exact score tie
+    breaks evenly between sources instead of one side consistently winning
+    ties -- the actual order is driven by score, not by source."""
+    interleaved = []
+    for i in range(max(len(arkan_items), len(market_items))):
+        if i < len(market_items):
+            interleaved.append((market_items[i], i))
+        if i < len(arkan_items):
+            interleaved.append((arkan_items[i], i))
+
+    scored = [
+        (_score_result(item, idx, bedrooms, min_price, max_price), item)
+        for item, idx in interleaved
+    ]
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+
+    for _score, item in scored:
+        if len(pool) >= limit:
+            break
+        add_fn(item, pool)
+
+
 def search_properties(area, transaction_type="sale", property_type=None,
                        min_price=None, max_price=None, bedrooms=None,
                        include_public_sources=True, limit=10):
     """Tool entry point called by the Gemini agent. Searches the Lebanese
     market as ONE generic pool: Arkan Estate's site and the wider market
-    (OLX, other portals, open web) all run concurrently and get merged
-    into a single flat "results" list -- interleaved, not ordered by
-    source, so no single site (including Arkan) is presented first or
-    labeled as a priority. Each result item's own "url" naturally reveals
-    which site it's on; nothing here names Arkan explicitly (see
-    agent/system_prompt.py for how results should be described in a reply).
+    (OLX, other portals, open web) all run concurrently and get merged into
+    a single flat "results" list, ranked best-first by how well each result
+    actually matches the request, how recently it was listed, how complete
+    its price is, and how many useful features its description mentions
+    (see _score_result) -- never by which site found it, so no single site
+    (including Arkan) is ever favored in that ranking. Each result item's
+    own "url" naturally reveals which site it's on; nothing here names
+    Arkan explicitly (see agent/system_prompt.py for how results should be
+    described in a reply).
 
     When a bedroom count is requested and confirmed exact matches alone
     don't fill out a full page of `limit` results, the list is topped up
@@ -761,34 +961,23 @@ def search_properties(area, transaction_type="sale", property_type=None,
         bucket.append(item)
         return True
 
-    # Interleave rather than concatenate -- concatenating would always put
-    # one source's results ahead of the other's, which is exactly the
-    # "priority source" framing this is meant to avoid.
-    arkan_results = arkan_out.get("results", [])
-    market_results = market_out.get("results", [])
     merged = []
-    for i in range(max(len(arkan_results), len(market_results))):
-        if len(merged) >= limit:
-            break
-        if i < len(market_results):
-            _add(market_results[i], merged)
-        if i < len(arkan_results) and len(merged) < limit:
-            _add(arkan_results[i], merged)
+    _rank_and_fill(
+        merged, arkan_out.get("results", []), market_out.get("results", []),
+        bedrooms, min_price, max_price, limit, _add,
+    )
 
     # A bedroom count was requested but confirmed exact matches alone are
-    # thin -- top the list up with real, honestly-labeled close matches
-    # (see search_arkan/search_market/_resolve_bedrooms) rather than
-    # leaving the reply with little or nothing to actually show.
+    # thin -- top the list up with the best of the real, honestly-labeled
+    # close matches (see search_arkan/search_market/_resolve_bedrooms),
+    # ranked the same way, rather than leaving the reply with little or
+    # nothing to actually show.
     if bedrooms and len(merged) < limit:
-        arkan_close = arkan_out.get("close_matches", [])
-        market_close = market_out.get("close_matches", [])
-        for i in range(max(len(arkan_close), len(market_close))):
-            if len(merged) >= limit:
-                break
-            if i < len(market_close):
-                _add(market_close[i], merged)
-            if i < len(arkan_close) and len(merged) < limit:
-                _add(arkan_close[i], merged)
+        _rank_and_fill(
+            merged, arkan_out.get("close_matches", []),
+            market_out.get("close_matches", []),
+            bedrooms, min_price, max_price, limit, _add,
+        )
 
     return {
         "results": merged,
