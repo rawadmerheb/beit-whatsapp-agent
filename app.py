@@ -61,7 +61,56 @@ os.makedirs(AUDIO_DIR, exist_ok=True)
 # before you need history to survive a restart.
 HISTORY = {}
 CHAT_HISTORY = {}  # same idea, keyed by the web chat's per-browser session_id
-HISTORY_TURNS_KEPT = 12
+
+# 2026-08-24: THIS USED TO BE A PLAIN NUMBER OF RAW ENTRIES, AND THAT WAS A BUG.
+#
+# Gemini's API hard-rejects a `function_response` turn that isn't immediately
+# preceded by its matching `function_call` turn, with:
+#   400 INVALID_ARGUMENT: "Please ensure that function response turn comes
+#   immediately after a function call turn."
+# (seen for real in Render's logs on 2026-08-24 at 02:56:14 PM.)
+#
+# The old code did `new_history[-HISTORY_TURNS_KEPT:]` -- a plain slice off
+# the end of the raw list of Content entries. Every time the agent uses the
+# search_properties tool, that adds a *pair* of entries (the model's
+# "call the tool" turn, immediately followed by the "here's what it found"
+# turn) that must never be separated. A flat `[-12:]` slice has no idea
+# that pairing exists, so once a conversation had a few tool-using rounds in
+# it, the slice could land right in the middle of a pair -- keeping the
+# second half of the pair without the first half in front of it. The very
+# next message in that conversation would then get rejected by Gemini with
+# the exact 400 error above.
+#
+# The fix: only ever cut a stored history at the start of a genuine new user
+# message (never inside a call/response pair), and count in terms of real
+# back-and-forth exchanges rather than raw entries.
+HISTORY_EXCHANGES_KEPT = 6
+
+
+def _is_user_text_turn(content):
+    """True for a real new user message turn. A function_response turn also
+    has role="user" (Gemini has no separate "tool" role -- see
+    agent/claude_client.py's comment on this), but it must never be treated
+    as a safe place to cut the history, since it has to stay glued to the
+    function_call turn right before it.
+    """
+    if getattr(content, "role", None) != "user":
+        return False
+    parts = content.parts or []
+    return not any(getattr(p, "function_response", None) for p in parts)
+
+
+def _trim_history(history, max_exchanges):
+    """Keep the most recent `max_exchanges` real user messages (and
+    everything that belongs with each of them -- any tool call/response
+    pairs and the model's reply), without ever cutting a stored history in
+    the middle of a function_call/function_response pair.
+    """
+    boundaries = [i for i, c in enumerate(history) if _is_user_text_turn(c)]
+    if len(boundaries) <= max_exchanges:
+        return list(history)
+    cut = boundaries[-max_exchanges]
+    return list(history[cut:])
 
 
 @app.route("/")
@@ -116,7 +165,7 @@ def api_chat():
 
     history = CHAT_HISTORY.get(session_id, [])
     reply_text, new_history = ask_agent(user_text, history)
-    CHAT_HISTORY[session_id] = new_history[-HISTORY_TURNS_KEPT:]
+    CHAT_HISTORY[session_id] = _trim_history(new_history, HISTORY_EXCHANGES_KEPT)
 
     result = {"reply": reply_text, "transcript": user_text if is_voice_input else None}
 
@@ -162,7 +211,7 @@ def whatsapp_webhook():
 
     history = HISTORY.get(sender, [])
     reply_text, new_history = ask_agent(user_text, history)
-    HISTORY[sender] = new_history[-HISTORY_TURNS_KEPT:]
+    HISTORY[sender] = _trim_history(new_history, HISTORY_EXCHANGES_KEPT)
 
     twiml = MessagingResponse()
     msg = twiml.message(reply_text)
