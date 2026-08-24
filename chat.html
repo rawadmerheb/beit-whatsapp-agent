@@ -81,6 +81,13 @@
   .bubble a { color: var(--green-dark); text-decoration: underline; word-break: break-word; }
   .bubble a:visited { color: var(--green-dark); }
   .bubble strong { font-weight: 600; }
+  .bubble img {
+    display: block;
+    max-width: 100%;
+    height: auto;
+    border-radius: 8px;
+    margin-top: 6px;
+  }
 
   .typing { display: flex; gap: 4px; padding: 4px 2px; }
   .typing span {
@@ -300,6 +307,17 @@ function escapeHtml(str) {
 
 function formatBotText(text) {
   let html = escapeHtml(text);
+  // Markdown images: ![alt](https://...) -- MUST run before the link
+  // regex below, since a link is just an image without the leading "!"
+  // and would otherwise incorrectly swallow the "![alt](url)" text first
+  // (leaving a stray "!" in front of a plain link instead of a photo).
+  // Added 2026-08-28 per the user's "add thumbnails" request -- property
+  // results now come back with an "image_url", which the assistant is
+  // instructed (see agent/system_prompt.py) to include this way.
+  html = html.replace(
+    /!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/g,
+    '<img src="$2" alt="$1" loading="lazy">'
+  );
   // Markdown links: [label](https://...)
   html = html.replace(
     /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
@@ -408,7 +426,7 @@ textInput.addEventListener('keydown', (e) => {
 //   - Drag left past a threshold -> cancels and discards the recording.
 //   - Drag up past a threshold   -> "locks" the recording hands-free: the
 //     mic becomes a cancel (trash) button and the send button becomes
-//     "stop and send", so you don't have to keep holding your finger down.
+//     "stop and send", so you don't have to keep holding.
 //   - Release without locking/cancelling -> stops and sends immediately.
 //
 // Also fixes a real bug from the old tap-to-toggle version: the recorded
