@@ -117,11 +117,14 @@ by testing. It's fine to name OLX specifically when presenting a result
 found there.
 
 For everything beyond OLX and Arkan -- the long tail of other agencies,
-brokers, and portals -- `search_market()` also runs two DuckDuckGo queries
-(no API key, no signup, no cost): one for the other curated portals
-(OTHER_KNOWN_PORTALS), one fully open (no site filter) so whichever
+brokers, and portals -- `search_market()` also runs several DuckDuckGo/
+Serper queries: OTHER_KNOWN_PORTALS chunked into small site: groups (see
+OTHER_PORTALS_CHUNK_SIZE and the module docstring's 2026-08-29 "WHY DO I
+ONLY EVER GET JSK FIRST?" section for why it's chunked rather than one
+single query), plus one fully open query (no site filter) so whichever
 agency/broker/portal is indexed for that search shows up regardless of any
-curated list. Both run concurrently with the direct OLX scrape.
+curated list. All run concurrently with each other and with the direct
+OLX scrape.
 OTHER_KNOWN_PORTALS was expanded 2026-08-24 with a batch of specific
 Lebanese sites the user pulled from their own Google search (Confidence
 Real Estate, JSK Real Estate, Trust Lebanon Agency, Century 21 Lebanon,
@@ -409,6 +412,108 @@ Two sources for a thumbnail, used in order of how cheap they are:
     broken link before it ever reaches the person, pulling in the next-
     best real candidate from a slightly oversized ranked pool
     (RESULT_RESERVOIR_BUFFER) instead of just running a result short.
+
+A DEAD PAGE THAT'S "TOO LONG TO LOOK DEAD" (found + fixed 2026-08-29)
+---------------------------------------------------------------------------
+The user hit https://www.jskre.com/listings/edde-jbeil -- a real, confirmed
+error (a live fetch of it returns HTTP 410 Gone directly), yet it still
+reached them as a result. Two things converged:
+  - "/listings/<slug>" turns out to be jskre.com's own CATEGORY/archive
+    path (confirmed via a real fetch of jskre.com's homepage nav: real
+    individual listings are at "/properties/<slug>-l<ID>"; "/listings/"
+    is used for pages like "/listings/for-sale", "/listings/for-rent",
+    "/listings/for-sale-in-france") -- this one slipped past
+    _looks_like_listing_page() because "/listings/" isn't one of the
+    denylisted NON_LISTING_PATH_MARKERS. It's deliberately NOT being added
+    there, though: this codebase has no reliable way to know whether some
+    other curated site's "/listings/" means "category page" (like jskre)
+    or "individual listing" (a real, common convention on other sites) --
+    guessing wrong would silently drop good results elsewhere. See below
+    for the real, general fix instead.
+  - The real gap: when this URL is fetched (whether directly, or proxied
+    through ScraperAPI when SCRAPER_API_KEY is set), ScraperAPI's own
+    documented status-code behavior only explicitly covers 200 and 404 --
+    what happens to a 410 specifically when proxied isn't documented, and
+    a full WordPress theme's nav/footer/cookie-banner chrome alone can
+    easily clear _looks_dead_page()'s old 250-character floor even when
+    the actual page has zero real listing content. So the length check
+    alone wasn't enough here. Fixed by giving _looks_dead_page() a second,
+    positive-evidence check: does this page's text mention an actual price
+    ($ or USD/L.L. next to digits) OR a basic property attribute (bedroom,
+    bathroom, sqm/m²/square feet, etc.) ANYWHERE? A real listing page -- on
+    any site this code scrapes -- always states at least one of those;
+    chrome-only/error content never does, regardless of its URL shape or
+    however its HTTP status came through the proxy. Deliberately does NOT
+    treat "for sale"/"for rent" as attribute evidence -- confirmed by
+    testing that those exact phrases routinely live in a site's own
+    persistent nav menu (a link literally labeled "For Sale"), which would
+    appear on every page including a dead one and defeat the check.
+
+"WHY DO I ONLY EVER GET JSK FIRST?" -- A REAL RANKING-CONCENTRATION BUG
+(found + fixed 2026-08-29)
+---------------------------------------------------------------------------
+search_market() used to build exactly ONE Serper/Google query for ALL of
+OTHER_KNOWN_PORTALS at once, OR-ing every curated domain's site: filter
+together into a single query. That's a real problem: Google (via Serper)
+ranks the results of that one query by its own relevance/authority
+signals across the whole OR clause, and there's no reason to expect it to
+spread hits evenly across a dozen-plus sites of very different SEO
+strength -- in practice it consistently surfaced only jskre.com, crowding
+out every other curated portal even though several of them have real,
+matching listings. Fixed by chunking OTHER_KNOWN_PORTALS into small groups
+(OTHER_PORTALS_CHUNK_SIZE) and running one query PER CHUNK, concurrently,
+instead of one giant query for the whole list -- every chunk's small OR
+clause gives its member sites a real, independent shot at surfacing,
+rather than competing against every other curated site at once. Costs a
+few more concurrent Serper calls per search (still fast, non-render
+requests -- see SCRAPER_API_RENDER_TIMEOUT's docstring for why render
+fetches are the only slow ones), not a meaningful latency hit against
+Arkan's own up-to-70s render stage running concurrently alongside it.
+
+"CHECK THE LAST PROPERTIES POSTED... LAST 120 DAYS" (added 2026-08-29)
+---------------------------------------------------------------------------
+The user asked for freshness to actually be checked, not just assumed via
+each source's own newest-first list order (see _score_result's existing
+"newly listed" proxy). There's no reliable API-level "posted in the last
+120 days" filter available here: Serper's own tbs date-range parameter
+only documents whole-hour/day/week/month buckets (no arbitrary day count,
+and Google's own indexing-freshness isn't the same thing as a property's
+actual posting date anyway), so that's not used for a hard cutoff. Instead
+_extract_days_old() reads a REAL, explicit "X days/weeks/months ago" (or
+"today"/"yesterday") straight from a card's own teaser text, a search
+snippet, or the listing's own detail page -- exactly the same "read the
+real page, don't guess" principle already used for bedroom count and
+price. When a real age is confirmed, _score_result() rewards anything
+within the requested 120-day window and mildly deprioritizes (never
+excludes) anything confirmed older -- consistent with this file's
+established rule (see the bedroom-count sections above) that a real,
+matching listing never gets silently dropped just because one signal
+about it looks worse; an unconfirmed age (most sites don't expose a date
+at all) is treated exactly as it was before this existed, no bonus or
+penalty.
+
+EXPANDING PAST "A FEW WEBSITES" (2026-08-29)
+---------------------------------------------------------------------------
+The user asked for at least 30 credible sites, correctly pointing out that
+15 curated portals plus Arkan/OLX was still thin next to how many real
+agencies actually operate in Lebanon. OTHER_KNOWN_PORTALS was expanded from
+15 to 32 entries -- each one individually verified the same way every prior
+addition was (a real fetch of its homepage AND at least one individual
+listing page showing a genuine price/description, not just a corporate
+site with nothing to scrape). Several strong-looking candidates were
+checked and deliberately left OUT after failing that bar: OpenSooq's
+Lebanon section is real, but every individual listing page fetched came
+back HTTP 403 (bot-blocked) -- nothing to scrape even though the site
+itself is legitimate; propertyfinder.com.lb's SSL is currently broken
+(hostname mismatch on every attempt); Bayut and Aqarmap have no genuine
+Lebanon-country coverage at all (their "Lebanon" hits turned out to be a
+Dubai artificial-island development and a Cairo street, respectively); and
+none of the major international franchise brands searched (Keller
+Williams, Sotheby's International Realty, Engel & Volkers, Coldwell
+Banker, Cushman & Wakefield, Savills, Knight Frank, JLL) turned up a real,
+working Lebanon-specific website -- only RE/MAX did, via its Tripoli
+franchise site. Better to under-promise here than add a domain that turns
+out to be dead weight the moment it's queried.
 """
 
 import logging
@@ -547,6 +652,56 @@ OTHER_KNOWN_PORTALS = [
                                 # real estate agency, confirmed listing pages
     "pbm-leb.com",             # Lebanon brokerage since 2007, confirmed
                                 # individual /property/<id> listing pages
+    # Batch added 2026-08-29 per the user's "find at least 30 credible
+    # websites" ask -- each one confirmed via a real fetch of its own
+    # homepage AND at least one individual listing page showing a real
+    # price/description (not just a corporate page with nothing to
+    # scrape), same verification bar as every entry above. See module
+    # docstring's 2026-08-29 section for what was checked and deliberately
+    # left out (OpenSooq, propertyfinder.com.lb, Bayut, Aqarmap, and the
+    # major international franchise brands beyond RE/MAX).
+    "remax-tripoli.com",       # RE/MAX Lebanon's actual franchise site
+                                # (Tripoli office) -- confirmed individual
+                                # listings (e.g. a priced Koura villa) and
+                                # a dedicated Batroun archive
+    "localsrealestatelb.com",  # Beirut-area licensed broker (Elissar
+                                # office), confirmed priced listing pages
+    "dealers-group.com",       # Beirut (Hamra) brokerage, confirmed
+                                # listings across Achrafieh and a dedicated
+                                # Jbeil/Byblos page
+    "reflb.com",               # Real Estate Finder Lebanon -- multi-agency
+                                # portal, confirmed listings across Beirut,
+                                # Mount Lebanon, North, and Bekaa
+    "chidiac-realestate.com",  # Keserwan/Metn brokerage (CHRE), confirmed
+                                # listings covering Adma, Jbeil, and Jounieh
+    "whiterealestategroup.com",  # Achrafieh-based luxury brokerage,
+                                # confirmed high-end priced listings
+    "s-gestion.realestate",    # Beirut agency portal (est. 1996), confirmed
+                                # listings across Metn, Batroun, Keserwan
+    "arezrealestate.com",      # Beirut/Mount Lebanon brokerage, confirmed
+                                # ~19 active priced listings
+    "lebanonmls.com.lb",       # "Lebanon MLS" nationwide listings
+                                # aggregator, confirmed individual listings
+    "lebaqar.com",             # LebAqar -- peer-to-peer Lebanese listing
+                                # platform, confirmed real priced listings
+    "realtylebanon.com",       # Realty Lebanon, confirmed active listings
+                                # across Mount Lebanon/Beirut
+    "rizkproperties.net",      # Rizk Properties (Dbayeh), confirmed
+                                # listings across Batroun, Jbeil, Keserwan,
+                                # Metn
+    "isold-realestate.com",    # iSOLD Real Estate, Lebanese Real Estate
+                                # Syndicate member, confirmed listings
+                                # across Metn, Keserwan, Jbeil, Batroun
+    "icarwakim.com",           # ICAR Wakim, Beit Mery agency since 2002,
+                                # confirmed listings incl. a dedicated
+                                # Batroun page
+    "elegant-realestate.com",  # Elegant Real Estate, confirmed active
+                                # sale/rent listings across Lebanon
+    "byblosestate.com",        # Jbeil/Byblos-based agency office (Blat-
+                                # Jbeil), confirmed listings across Jbeil,
+                                # Batroun, Kesrouan
+    "lpirealestate.com",       # Keserwan-specific brokerage (Sahel Alma,
+                                # Faqra), confirmed priced listings
 ]
 
 # Per-request timeout for Arkan and the DuckDuckGo queries. Kept modest
@@ -580,6 +735,19 @@ DDG_BEDROOM_DETAIL_FETCH_CAP = 6
 # best-first, so the extras are only ever used to backfill a dropped
 # slot, never to bump a genuinely worse result ahead of a better one).
 RESULT_RESERVOIR_BUFFER = 10
+# See module docstring's 2026-08-29 "WHY DO I ONLY EVER GET JSK FIRST?"
+# section -- one giant OR-of-all-curated-portals query let Google's own
+# ranking crowd out every site but the strongest one. Splitting
+# OTHER_KNOWN_PORTALS into chunks this small and querying each separately
+# gives every curated site a real, independent shot at surfacing.
+OTHER_PORTALS_CHUNK_SIZE = 5
+# See module docstring's 2026-08-29 "last 120 days" section -- a real,
+# confirmed listing age within this window is rewarded in _score_result();
+# an age confirmed OLDER than this is deprioritized, never excluded
+# outright (a listing with no confirmed age at all is neither -- most
+# sites this code scrapes don't expose a date, and that's not evidence of
+# anything).
+RECENCY_WINDOW_DAYS = 120
 
 
 def _slugify(text):
@@ -616,6 +784,55 @@ def _extract_bedroom_count(text):
     m = re.search(r"bed\s?rooms?\s*[:\-]?\s*(\d+)", lower)
     if m:
         return int(m.group(1))
+    return None
+
+
+# See module docstring's 2026-08-29 "last 120 days" section.
+_RELATIVE_AGE_RE = re.compile(
+    r"\b(\d+)\s*(hour|hours|day|days|week|weeks|month|months|year|years)\s*ago\b",
+    re.IGNORECASE,
+)
+_TODAY_AGE_MARKERS = ("today", "just now", "a few minutes ago", "a moment ago")
+_YESTERDAY_AGE_MARKERS = ("yesterday",)
+
+
+def _extract_days_old(text):
+    """Best-effort real "how long ago was this posted" estimate, read
+    directly from the listing's own text (a card teaser, a search
+    snippet, or its full detail page) -- e.g. OLX and several portals
+    show "3 days ago" / "2 weeks ago" right on the card. Returns an
+    integer number of days, or None when nothing like this is stated
+    anywhere (a very common case -- most sites this code scrapes don't
+    expose a posting date at all). Never guessed or fabricated: only ever
+    a real, explicitly-parsed number from the page's own text (see
+    _score_result for how this is used -- a real but old date is
+    deprioritized, never a reason to drop an otherwise-good listing, and
+    an unparseable date is treated exactly as it was before this existed,
+    with no bonus or penalty either way)."""
+    if not text:
+        return None
+    lower = text.lower()
+    for marker in _TODAY_AGE_MARKERS:
+        if marker in lower:
+            return 0
+    for marker in _YESTERDAY_AGE_MARKERS:
+        if marker in lower:
+            return 1
+    m = _RELATIVE_AGE_RE.search(lower)
+    if not m:
+        return None
+    n = int(m.group(1))
+    unit = m.group(2)
+    if unit.startswith("hour"):
+        return 0
+    if unit.startswith("day"):
+        return n
+    if unit.startswith("week"):
+        return n * 7
+    if unit.startswith("month"):
+        return n * 30
+    if unit.startswith("year"):
+        return n * 365
     return None
 
 
@@ -722,6 +939,7 @@ def _parse_arkan_cards(html, transaction_type, property_type,
         if max_price and price and price > max_price:
             continue
 
+        days_old = _extract_days_old(text_block)
         results.append({
             "title": title,
             "url": href if href.startswith("http") else ARKAN_BASE + href,
@@ -729,6 +947,7 @@ def _parse_arkan_cards(html, transaction_type, property_type,
             "snippet": text_block[:220],
             "bedrooms_hint": _extract_bedroom_count(text_block),
             "image_url": _extract_card_image(card, ARKAN_BASE),
+            **({"days_old": days_old} if days_old is not None else {}),
         })
         if len(results) >= limit:
             break
@@ -926,6 +1145,30 @@ DEAD_PAGE_TEXT_MARKERS = (
 )
 DEAD_PAGE_MIN_TEXT_LENGTH = 250
 
+# Added 2026-08-29: a real, confirmed dead page the user hit
+# (https://www.jskre.com/listings/edde-jbeil, an actual HTTP 410 Gone)
+# still cleared the length floor above -- a full WordPress theme's own
+# nav/footer/cookie-banner chrome alone is often well over 250 characters
+# even when the page underneath has zero real listing content, and
+# ScraperAPI's own documented status-code behavior doesn't clearly cover
+# what happens to a non-200/404 target status like 410 when proxied. See
+# module docstring's 2026-08-29 "too long to look dead" section. A real
+# listing page -- on literally any site this code scrapes -- always
+# states an actual price and/or a basic property attribute somewhere in
+# its own text; chrome-only/error content never does.
+PRICE_LIKE_RE = re.compile(r"\$\s?\d|\busd\s*\d|\bl\.?l\.?\s*\d", re.IGNORECASE)
+# Deliberately does NOT include "for sale"/"for rent" -- those are exactly
+# the kind of phrase that lives in a site's own persistent nav menu (a
+# link literally labeled "For Sale") and shows up on EVERY page, including
+# a broken/dead one, which would defeat the whole point of this check.
+# Confirmed by testing against a realistic simulated dead page: nav chrome
+# routinely contains "For Sale"/"For Rent" as menu items regardless of
+# whether the actual page underneath is alive.
+LISTING_ATTRIBUTE_MARKERS = (
+    "bedroom", "bathroom", "sqm", "sq m", "sq. m", "m²", "square meter",
+    "square feet", "sq ft",
+)
+
 
 def _looks_dead_page(html):
     """Is this fetched page essentially blank/broken rather than a real,
@@ -938,7 +1181,13 @@ def _looks_dead_page(html):
     lower = text.lower()
     if any(marker in lower for marker in DEAD_PAGE_TEXT_MARKERS):
         return True
-    return len(text) < DEAD_PAGE_MIN_TEXT_LENGTH
+    if len(text) < DEAD_PAGE_MIN_TEXT_LENGTH:
+        return True
+    has_price = bool(PRICE_LIKE_RE.search(lower))
+    has_attribute = any(marker in lower for marker in LISTING_ATTRIBUTE_MARKERS)
+    if not has_price and not has_attribute:
+        return True
+    return False
 
 
 def _resolve_bedrooms(candidates, bedrooms, cap=BEDROOM_DETAIL_FETCH_CAP):
@@ -1023,6 +1272,10 @@ def _resolve_bedrooms(candidates, bedrooms, cap=BEDROOM_DETAIL_FETCH_CAP):
                 og_image = _extract_og_image(html, item["url"])
                 if og_image:
                     item["image_url"] = og_image
+            if item.get("days_old") is None:
+                detail_days_old = _extract_days_old(page_text)
+                if detail_days_old is not None:
+                    item["days_old"] = detail_days_old
             item["_verified"] = True
             if confirmed is not None:
                 item["bedrooms"] = confirmed
@@ -1220,6 +1473,7 @@ def _parse_olx_cards(html, property_type, limit):
         if property_type and property_type.lower() not in lower:
             continue
 
+        days_old = _extract_days_old(text_block)
         results.append({
             "title": title,
             "url": full_url,
@@ -1227,6 +1481,7 @@ def _parse_olx_cards(html, property_type, limit):
             "snippet": text_block[:220],
             "bedrooms_hint": _extract_bedroom_count(text_block),
             "image_url": _extract_card_image(card, OLX_BASE),
+            **({"days_old": days_old} if days_old is not None else {}),
         })
         if len(results) >= limit:
             break
@@ -1384,6 +1639,9 @@ def _ddg_search(query, limit):
         price = _clean_price(combined_text)
         if price is not None:
             item["price_usd"] = price
+        days_old = _extract_days_old(combined_text)
+        if days_old is not None:
+            item["days_old"] = days_old
         out.append(item)
     if not out:
         logger.warning(
@@ -1431,6 +1689,9 @@ def _serper_search(query, limit):
         price = _clean_price(combined_text)
         if price is not None:
             item["price_usd"] = price
+        days_old = _extract_days_old(combined_text)
+        if days_old is not None:
+            item["days_old"] = days_old
         out.append(item)
     if not out:
         logger.warning(
@@ -1454,10 +1715,12 @@ def _web_search(query, limit):
 def search_market(area, transaction_type="sale", property_type=None,
                    bedrooms=None, limit=10):
     """Search the Lebanese market beyond Arkan: OLX scraped directly, the
-    other known major portals, and an unrestricted search with no site
-    filter, so agencies/brokers not on the curated list still surface too.
-    All three run concurrently and are merged, deduped by domain+path.
-    Always includes "olx_search_url" -- a live, correctly filtered OLX
+    other known major portals (queried in small chunks -- see
+    OTHER_PORTALS_CHUNK_SIZE -- rather than one giant combined query, so no
+    single strong site crowds out the rest), and an unrestricted search
+    with no site filter, so agencies/brokers not on the curated list still
+    surface too. All of these run concurrently and are merged, deduped by
+    domain+path. Always includes "olx_search_url" -- a live, correctly filtered OLX
     link -- even when nothing was scraped. When a bedroom count is
     requested, EVERY candidate -- OLX and the other-portals/open-web
     DuckDuckGo results alike -- gets the same real confirmation Arkan's
@@ -1476,10 +1739,22 @@ def search_market(area, transaction_type="sale", property_type=None,
 
     olx_search_url = _olx_search_url(area, transaction_type, property_type, bedrooms)
     olx_scrape_url = _olx_category_url(area, transaction_type)
-    other_site_filter = " OR ".join(f"site:{d}" for d in OTHER_KNOWN_PORTALS)
-    other_portals_query = f"{area}{ptype} {kind} Lebanon ({other_site_filter})"
+    # Chunked into small groups rather than one giant OR-of-everything query
+    # -- see module docstring's 2026-08-29 "WHY DO I ONLY EVER GET JSK
+    # FIRST?" section. A single query OR-ing all of OTHER_KNOWN_PORTALS
+    # together let Google's own ranking crowd out every curated site but
+    # the strongest one; querying each small chunk separately gives every
+    # site a real, independent chance to surface.
+    portal_chunks = [
+        OTHER_KNOWN_PORTALS[i:i + OTHER_PORTALS_CHUNK_SIZE]
+        for i in range(0, len(OTHER_KNOWN_PORTALS), OTHER_PORTALS_CHUNK_SIZE)
+    ]
+    other_portals_queries = [
+        f"{area}{ptype} {kind} Lebanon (" + " OR ".join(f"site:{d}" for d in chunk) + ")"
+        for chunk in portal_chunks
+    ]
     open_query = f"{area}{ptype} {kind} Lebanon real estate agency broker listing"
-    ddg_queries = [other_portals_query, open_query]
+    ddg_queries = other_portals_queries + [open_query]
 
     with ThreadPoolExecutor(max_workers=len(ddg_queries) + 1) as pool:
         olx_future = pool.submit(_scrape_olx_cards, olx_scrape_url, property_type, limit * 3)
@@ -1632,6 +1907,12 @@ def _score_result(item, index_in_source, bedrooms, min_price, max_price):
     - features: a richer, more informative description (see
       FEATURE_KEYWORDS) edges out a bare-bones one when everything else
       about two listings is equal.
+    - real, confirmed posting age (see _extract_days_old): a listing
+      confirmed posted within RECENCY_WINDOW_DAYS is rewarded, one
+      confirmed OLDER is mildly deprioritized (never excluded outright --
+      see module docstring's 2026-08-29 "last 120 days" section). Most
+      listings have no confirmed age at all; that's neutral, not a strike
+      against them.
     """
     score = 0.0
 
@@ -1656,6 +1937,14 @@ def _score_result(item, index_in_source, bedrooms, min_price, max_price):
             score -= 15.0
 
     score += min(_feature_score(item), 5)  # features
+
+    days_old = item.get("days_old")
+    if days_old is not None:
+        if days_old <= RECENCY_WINDOW_DAYS:
+            score += 8.0   # confirmed within the requested freshness window
+        else:
+            score -= 8.0   # confirmed OLDER -- deprioritized, not excluded
+    # else: age simply unconfirmed -- no bonus, no penalty
 
     return score
 
@@ -1738,6 +2027,11 @@ def _finalize_and_enrich(ranked_candidates, limit):
                 og_image = _extract_og_image(html, item["url"])
                 if og_image:
                     item["image_url"] = og_image
+            if item.get("days_old") is None:
+                page_text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
+                detail_days_old = _extract_days_old(page_text)
+                if detail_days_old is not None:
+                    item["days_old"] = detail_days_old
 
     final = []
     for item in ranked_candidates:
