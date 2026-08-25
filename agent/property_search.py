@@ -440,7 +440,7 @@ reached them as a result. Two things converged:
     alone wasn't enough here. Fixed by giving _looks_dead_page() a second,
     positive-evidence check: does this page's text mention an actual price
     ($ or USD/L.L. next to digits) OR a basic property attribute (bedroom,
-    bathroom, sqm/m²/square feet, etc.) ANYWHERE? A real listing page -- on
+    bathroom, sqm/m², square feet, etc.) ANYWHERE? A real listing page -- on
     any site this code scrapes -- always states at least one of those;
     chrome-only/error content never does, regardless of its URL shape or
     however its HTTP status came through the proxy. Deliberately does NOT
@@ -631,23 +631,23 @@ every earlier fix this file already has:
    ("if not candidates:"). Re-fetched arkanestate.com/area/jamhour/ live
    to confirm the exact scenario: that page renders exactly ONE real
    listing (still true, same as the previous section), so `candidates`
-   already had 1 item and this whole fallback was being skipped entirely,
-   even though Arkan's own broader search might genuinely have more to
-   offer for that name. A location page that's merely thin (a handful of
-   results, not enough to fill a reply) was being treated exactly like a
-   location page that came back completely empty. Confirmed via a live
-   fetch that this isn't an ARKAN_PAGES_PER_SEARCH problem instead:
-   arkanestate.com/city/beirut/ has only 3 real pagination pages total
-   (page 4 is a genuine 404) and arkanestate.com/city/mount-lebanon/ has
-   only 1 page, period -- so the existing page count (4) already covers
-   every city page in full; the real gap was purely the fallback's
-   trigger condition. Fixed by changing the trigger from "the dedicated
-   page found nothing at all" to "the dedicated page didn't find enough"
-   (len(candidates) < limit) -- still fully additive (existing seen_urls
-   dedup prevents duplicates between the two passes) and still skipped
-   once enough real candidates already exist, so this never runs
-   pointless extra fetches when a page is already well-stocked (e.g.
-   Beirut, Jbeil).
+   already had 1 item in it and the sitewide-search backup was being
+   skipped entirely -- even though Arkan's own broader search might
+   genuinely have more to offer for that name. A location page that's
+   merely thin (a handful of results, not enough to fill a reply) was
+   being treated exactly like a location page that came back completely
+   empty. Confirmed via a live fetch that this isn't an ARKAN_PAGES_PER_
+   SEARCH problem instead: arkanestate.com/city/beirut/ has only 3 real
+   pagination pages total (page 4 is a genuine 404) and
+   arkanestate.com/city/mount-lebanon/ has only 1 page, period -- so the
+   existing page count (4) already covers every city page in full; the
+   real gap was purely the fallback's trigger condition. Fixed by
+   changing the trigger from "the dedicated page found nothing at all" to
+   "the dedicated page didn't find enough" (len(candidates) < limit) --
+   still fully additive (existing seen_urls dedup prevents duplicates
+   between the two passes) and still skipped once enough real candidates
+   already exist, so this never runs pointless extra fetches when a page
+   is already well-stocked (e.g. Beirut, Jbeil).
 
 2. RECENCY_WINDOW_DAYS raised from 120 to 180 (6 months) per the user's
    explicit ask to widen how far back this code looks before treating a
@@ -873,6 +873,58 @@ for two further, explicit changes:
    nothing gets fabricated to fill that slot -- the reply simply won't
    have one, the same as it wouldn't for any other source with nothing
    real to offer.
+
+"STILL NOT SHOWING ARKAN" -- THE GUARANTEE HAD NOTHING TO PROMOTE FROM
+(found + fixed 2026-09-04)
+---------------------------------------------------------------------------
+The user reported the 2026-09-03 guarantee wasn't working: Arkan still
+wasn't showing up. Reproduced this directly (not guessed at) by rebuilding
+_rank_and_fill()'s actual candidate-selection logic with realistic inputs
+in a throwaway script, run before writing any fix: a bedroom count
+requested (by far the most common real query shape in this whole
+project's history -- "3 bedrooms in Jbeil," etc.), Arkan's own candidates
+with an UNCONFIRMED bedroom count (a real, common case -- see the
+2026-08-24 section above on why Arkan's card teaser often doesn't state
+bedroom count clearly), and enough market-side candidates (OLX/other
+portals) with a CONFIRMED exact bedroom match to fill the entire
+`reservoir_limit`-sized pool on their own. The reproduction confirmed the
+worst case exactly: after the first _rank_and_fill() pass (confirmed
+matches only), the reservoir was already completely full -- so the SECOND
+pass, the one that even looks at close_matches (where Arkan's
+unconfirmed-bedroom candidates actually live), never ran at all. See
+search_properties()'s own "if bedrooms and len(merged) < reservoir_limit"
+guard -- that condition was false, so the whole close_matches pass was
+skipped outright.
+
+That is a real, confirmed gap in the 2026-09-03 fix, not a deployment
+problem: _ensure_priority_domains() was built to promote a real Arkan/
+Confidence candidate that ranked below the top `limit` but was still
+SOMEWHERE in the already-ranked reservoir. It had no way to help when the
+candidate was never scored or added to that reservoir in the first place
+-- which is exactly what happens whenever Arkan's own candidates all land
+in close_matches and the market side alone has enough confirmed matches to
+fill every slot before close_matches ever gets considered. In that
+situation, "alive_candidates" handed to _ensure_priority_domains() never
+contained an Arkan item at all, so it correctly (by its own rules) did
+nothing -- but "correctly did nothing" here meant a real, live Arkan
+listing that did exist for this search still never reached the reply.
+
+Fixed by giving _ensure_priority_domains() a second, deeper fallback,
+_rescue_priority_domain(): when a priority domain has nothing in the
+ranked reservoir at all, this reads directly from that domain's OWN raw
+search output -- arkan_out's "results"/"close_matches" for Arkan,
+market_out's for Confidence -- completely independent of whether
+_rank_and_fill() ever got around to scoring or ranking it. This is the
+same real data search_arkan()/search_market() already returned earlier in
+this exact request; nothing here re-searches or invents anything. A
+rescued Arkan candidate needs no extra check (search_arkan() already
+fetched that exact archive page fresh, with render=True, moments earlier
+-- see DIRECTLY_SCRAPED_DOMAINS); a rescued Confidence candidate still
+gets the same real dead-page check _finalize_and_enrich() would have run,
+before ever being trusted. If a priority domain genuinely has nothing at
+all in EITHER the ranked reservoir OR its own raw output, this still does
+nothing for it -- same honest limit as always, just now checking in the
+right place before giving up.
 """
 
 import logging
@@ -1911,14 +1963,16 @@ def search_arkan(area, transaction_type="sale", property_type=None,
     # location page(s) above found ZERO listings at all) to "thin, not
     # just empty" -- confirmed live on arkanestate.com/area/jamhour/:
     # that page has exactly ONE real listing, so `candidates` already had
-    # 1 item and this whole fallback was being skipped entirely, even
-    # though Arkan's own sitewide search might well have more (nearby
-    # listings, a differently-tagged area, etc.) to add. The user asked
-    # for at least 10 real options whenever they exist -- a location page
-    # that's merely thin (1-9 results) is exactly the case this fallback
-    # needs to run for, not just a location page that came back fully
-    # empty. Still fully additive (seen_urls below prevents duplicates)
-    # and still skipped once `candidates` already has enough.
+    # 1 item in it and the sitewide-search backup was being skipped
+    # entirely -- even though Arkan's own broader search might genuinely
+    # have more to offer for that name. A location page that's merely thin
+    # (a handful of results, not enough to fill a reply) was being treated
+    # exactly like a location page that came back completely empty. The
+    # user asked for at least 10 real options whenever they exist -- a
+    # location page that's merely thin (1-9 results) is exactly the case
+    # this fallback needs to run for, not just a location page that came
+    # back fully empty. Still fully additive (seen_urls below prevents
+    # duplicates) and still skipped once `candidates` already has enough.
     if len(candidates) < limit:
         fallback_url = f"{ARKAN_BASE}/?s={area}"
         html = _fetch(fallback_url, render=True, retries=0)
@@ -2738,7 +2792,75 @@ def _priority_domain_of(item):
     return None
 
 
-def _ensure_priority_domains(alive_candidates, limit):
+def _rescue_priority_domain(domain, arkan_out, market_out):
+    """The real, deeper fallback added 2026-09-04 -- see module docstring's
+    "STILL NOT SHOWING ARKAN" section for the confirmed bug this closes.
+    _ensure_priority_domains() can only promote a priority-domain
+    candidate that's SOMEWHERE in the already-ranked reservoir it's
+    handed. That reservoir can genuinely never contain one at all -- most
+    commonly when a bedroom count is requested, Arkan's own candidates
+    land in close_matches with an unconfirmed count (a real, common case
+    -- see the 2026-08-24 section above), and the market side alone has
+    enough CONFIRMED exact matches to fill the whole reservoir before
+    close_matches ever gets a second look (see search_properties()'s
+    "if bedrooms and len(merged) < reservoir_limit" guard). In that case
+    there is nothing wrong to detect in the reservoir -- the candidate
+    just was never put there.
+
+    This reads directly from that domain's own raw search output instead:
+    arkan_out's "results" then "close_matches" for arkanestate.com (both
+    already best-first within their own list), or market_out's for any
+    other priority domain (currently just confidencerealestate.com) --
+    the exact same real data search_arkan()/search_market() already
+    returned earlier in this same request. Nothing here re-searches or
+    invents anything.
+
+    An Arkan candidate is trusted without a further check -- search_arkan()
+    already fetched that exact archive page fresh, with render=True,
+    moments earlier in this same request (see DIRECTLY_SCRAPED_DOMAINS).
+    Anything else (Confidence) gets the same real dead-page check
+    _finalize_and_enrich() would have run, plus the same thumbnail/
+    days_old backfill, before ever being trusted -- this candidate never
+    went through that pass, since it never made it into the ranked
+    reservoir in the first place.
+
+    Returns the first real, live candidate found, or None if this
+    domain genuinely has nothing at all in its own raw output either --
+    the same honest limit as everywhere else in this file: never
+    fabricates a result that doesn't exist."""
+    if domain in DIRECTLY_SCRAPED_DOMAINS:
+        raw = list(arkan_out.get("results", [])) + list(arkan_out.get("close_matches", []))
+    else:
+        raw = list(market_out.get("results", [])) + list(market_out.get("close_matches", []))
+
+    for item in raw:
+        if _priority_domain_of(item) != domain:
+            continue
+        if domain in DIRECTLY_SCRAPED_DOMAINS:
+            return item
+        html = _fetch(item["url"], render=_needs_render(item["url"]), retries=0)
+        if _looks_dead_page(html):
+            logger.warning(
+                "_rescue_priority_domain: a raw %s candidate (%s) never "
+                "made it into the ranked reservoir, and its own page now "
+                "looks dead/broken too -- skipping it, not promoting it.",
+                domain, item["url"],
+            )
+            continue
+        if not item.get("image_url"):
+            thumbnail = _extract_thumbnail(html, item["url"])
+            if thumbnail:
+                item["image_url"] = thumbnail
+        if item.get("days_old") is None:
+            page_text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
+            detail_days_old = _extract_days_old(page_text)
+            if detail_days_old is not None:
+                item["days_old"] = detail_days_old
+        return item
+    return None
+
+
+def _ensure_priority_domains(alive_candidates, limit, rescue_fn=None):
     """Guarantees that Arkan Estate and Confidence Real Estate each have at
     least one real, live result inside the final `limit`-sized reply
     whenever either one actually has ANY real, live candidate ANYWHERE in
@@ -2755,12 +2877,23 @@ def _ensure_priority_domains(alive_candidates, limit):
     Only ever costs ONE slot per missing priority domain -- the
     currently-lowest-ranked slot not already spoken for by an earlier
     promotion in this same call -- and only when that domain has zero
-    live results in the top `limit` already. Never fabricates a result:
-    if a priority domain genuinely has no real, live candidate anywhere
-    in `alive_candidates` (its own site couldn't be reached, or it
-    genuinely has nothing matching this query), this does nothing for
-    that domain, exactly the same "never invent what isn't there" rule as
-    everywhere else in this file.
+    live results in the top `limit` already.
+
+    Added 2026-09-04: when a priority domain has nothing anywhere in
+    `alive_candidates` (not even ranked below the cutoff -- it never made
+    it into the reservoir at all), this now calls `rescue_fn(domain)`, if
+    given one, as a deeper fallback before giving up -- see
+    _rescue_priority_domain() and module docstring's 2026-09-04 section
+    for the real, confirmed gap this closes (a common case with a
+    requested bedroom count, where the market side alone could fill the
+    whole reservoir with confirmed matches before Arkan's own
+    close_matches ever got considered).
+
+    Never fabricates a result either way: if a priority domain genuinely
+    has no real, live candidate in `alive_candidates` NOR (when rescue_fn
+    is given) in its own raw search output, this does nothing for that
+    domain -- the same "never invent what isn't there" rule as everywhere
+    else in this file.
 
     Returns the full list (still oversized) with priority-domain
     candidates promoted into the first `limit` positions where needed --
@@ -2783,9 +2916,21 @@ def _ensure_priority_domains(alive_candidates, limit):
             if _priority_domain_of(item) == domain:
                 promoted = rest.pop(i)
                 break
+
+        if promoted is None and rescue_fn is not None:
+            promoted = rescue_fn(domain)
+            if promoted is not None:
+                logger.info(
+                    "_ensure_priority_domains: rescued a live %s result "
+                    "straight from its own raw search output -- it never "
+                    "made it into the ranked reservoir at all (see module "
+                    "docstring's 2026-09-04 section).", domain,
+                )
+
         if promoted is None:
             # Genuinely nothing from this domain anywhere in the ranked
-            # pool -- an honest limit, not something to fabricate around.
+            # pool OR its own raw output -- an honest limit, not
+            # something to fabricate around.
             continue
 
         victim_idx = next(
@@ -2943,8 +3088,17 @@ def search_properties(area, transaction_type="sale", property_type=None,
     # 2026-09-03 section for why this explicit exception to "no site is
     # ever favored" exists (the user asked for it directly). Runs AFTER
     # ranking and dead-page filtering, so it only ever promotes a
-    # confirmed-alive candidate, never a fabricated one.
-    merged = _ensure_priority_domains(merged, limit)
+    # confirmed-alive candidate, never a fabricated one. Passes
+    # _rescue_priority_domain() as a deeper fallback (added 2026-09-04,
+    # see module docstring's "STILL NOT SHOWING ARKAN" section) for when a
+    # priority domain's real candidates never made it into `merged` at all
+    # -- arkan_out/market_out are still the exact raw per-source output
+    # from earlier in this same request, so this never re-searches or
+    # fabricates anything.
+    merged = _ensure_priority_domains(
+        merged, limit,
+        rescue_fn=lambda domain: _rescue_priority_domain(domain, arkan_out, market_out),
+    )
     merged = merged[:limit]
 
     # True only if EVERY source this call actually tried (Arkan, and OLX +
