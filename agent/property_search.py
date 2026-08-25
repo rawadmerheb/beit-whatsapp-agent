@@ -440,7 +440,7 @@ reached them as a result. Two things converged:
     alone wasn't enough here. Fixed by giving _looks_dead_page() a second,
     positive-evidence check: does this page's text mention an actual price
     ($ or USD/L.L. next to digits) OR a basic property attribute (bedroom,
-    bathroom, sqm/m², square feet, etc.) ANYWHERE? A real listing page -- on
+    bathroom, sqm/m²/square feet, etc.) ANYWHERE? A real listing page -- on
     any site this code scrapes -- always states at least one of those;
     chrome-only/error content never does, regardless of its URL shape or
     however its HTTP status came through the proxy. Deliberately does NOT
@@ -745,6 +745,73 @@ site diversity and a fuller count achievable wherever multiple real
 sources genuinely have matching listings for a given query. They do not
 fabricate a 4th, 5th, or 6th source out of nothing when a specific area
 truly only has real listings on one or two sites right now.
+
+EVERY SINGLE SEARCH QUERY FAILED WITH AN IDENTICAL 400 (2026-09-02)
+---------------------------------------------------------------------------
+The user tested a live search and, this time, pulled the actual Render
+logs rather than just describing the symptom -- and every single Serper
+query in that test failed with the identical error: "400 Client Error:
+Bad Request for url: https://google.serper.dev/search". Not some queries,
+not one flaky domain -- every chunk of OTHER_KNOWN_PORTALS, and (almost
+certainly, though cut off in the visible log) the final open query too.
+That single fact explains a lot at once: if the entire "search everything
+beyond OLX/Arkan" path is failing outright, no curated portal reachable
+only through it (Chidiac Real Estate included, which the user separately
+confirmed has real live Jbeil-area listings via its own site) could ever
+appear, no matter how correct the ranking/dedup/domain-cap logic is.
+
+Two real possibilities were checked before writing any fix, not guessed
+at, given this project's history of exactly one of them (a wrong value
+pasted into Render's SERPER_API_KEY box) happening twice already (see the
+2026-08-26 and 2026-08-27 sections above):
+  - Wrong/misconfigured API key: RULED OUT with real evidence this time --
+    the user checked Render's Environment tab and Serper's own dashboard
+    side by side, and the key matches exactly
+    (c1de70bcdc18583989c781550607bf2425ea4e87 in both places). Not a
+    repeat of the earlier mistake.
+  - A real logic bug in how many results this code asks Serper for: found
+    by rereading _serper_search() against its own documented intent. The
+    2026-08-30 section directly above this one says, in its own words,
+    "once a query needs more than 10, there's no reason to ask for fewer
+    than 100 (Serper's own max)" -- but the code that shipped was
+    `payload["num"] = min(limit, 100)`, which returns the SMALLER of the
+    two numbers, not a flat 100. For a typical call in this app (limit=44,
+    from search_market()'s `limit * 2` sizing), that evaluates to 44 --
+    an arbitrary, non-round number sent on every single query, which is
+    new behavior introduced by that exact 2026-08-30 change and which
+    lines up with when this "every query fails" symptom would first have
+    become possible. This is a real, provable mismatch between the code
+    and its own stated intent, independent of whatever Serper's exact
+    validation rules turn out to be.
+
+Fixed three ways, not just one guessed value, precisely because the first
+part above couldn't be confirmed with total certainty without a live test
+this sandbox has no way to run against Serper's real endpoint:
+  1. The actual bug: `num` is now set to a flat 100 (matching the
+     documented intent) whenever more than 10 results are needed, instead
+     of `min(limit, 100)`.
+  2. _serper_request() (split out of _serper_search() so both the normal
+     call and a retry can share it) now captures and logs Serper's own
+     response BODY text on an HTTP error, not just the generic exception
+     message. Before this, a failure only ever logged "400 Client Error:
+     Bad Request for url: ..." -- never Serper's own explanation of WHY,
+     which is exactly where an API states its own reason for rejecting a
+     request. That gap is what made this incident hard to pin down beyond
+     "something about the request is invalid" in the first place.
+  3. _serper_search() now retries once, automatically, with no "num"
+     field at all (Serper's own implicit default of ~10 results) whenever
+     a request that asked for more than that fails. This means that even
+     if the `num=100` fix above turns out not to be the whole story, one
+     query can never again silently return zero results the way every
+     single one did on 2026-09-02 -- worst case, it falls back to
+     Serper's original, always-worked default instead of failing outright.
+
+Same honest caveat as always: this makes the "everything beyond OLX/Arkan"
+search resilient to a bad `num` value again, and fixes the specific logic
+bug that didn't match its own documented intent. It can't guarantee
+Serper's API has no OTHER, still-undiscovered rejection reason -- that's
+exactly why point 2 above exists: so the next failure, if there is one,
+shows its real cause in the logs instead of requiring another guess.
 """
 
 import logging
@@ -1770,14 +1837,14 @@ def search_arkan(area, transaction_type="sale", property_type=None,
     # location page(s) above found ZERO listings at all) to "thin, not
     # just empty" -- confirmed live on arkanestate.com/area/jamhour/:
     # that page has exactly ONE real listing, so `candidates` already had
-    # 1 item and this whole fallback was being skipped entirely, even
-    # though Arkan's own sitewide search might well have more (nearby
-    # listings, a differently-tagged area, etc.) to add. The user asked
-    # for at least 10 real options whenever they exist -- a location page
-    # that's merely thin (1-9 results) is exactly the case this fallback
-    # needs to run for, not just a location page that came back fully
-    # empty. Still fully additive (seen_urls below prevents duplicates)
-    # and still skipped once `candidates` already has enough.
+    # 1 item in it and the sitewide-search backup was being skipped
+    # entirely, even though Arkan's own sitewide search might well have
+    # more (nearby listings, a differently-tagged area, etc.) to add. The
+    # user asked for at least 10 real options whenever they exist -- a
+    # location page that's merely thin (1-9 results) is exactly the case
+    # this fallback needs to run for, not just a location page that came
+    # back fully empty. Still fully additive (seen_urls below prevents
+    # duplicates) and still skipped once `candidates` already has enough.
     if len(candidates) < limit:
         fallback_url = f"{ARKAN_BASE}/?s={area}"
         html = _fetch(fallback_url, render=True, retries=0)
@@ -2083,6 +2150,51 @@ def _ddg_search(query, limit):
     return out, True
 
 
+def _serper_request(query, num=None):
+    """Makes exactly one POST request to Serper.dev's Search API and
+    returns (data, error): `data` is the parsed JSON response (None on any
+    failure), `error` is a human-readable description of what went wrong
+    (None on success). `num` is omitted from the request body entirely
+    when None, letting Serper apply its own implicit default (~10 results)
+    -- see _serper_search() for why a caller might deliberately want that.
+
+    Split out of _serper_search() on 2026-09-02 so that function can retry
+    once with a different `num` after a failure without duplicating the
+    request/error-handling logic, and so a failure's error text includes
+    Serper's own response BODY -- not just the generic exception message.
+    Before this, a failed request only ever logged something like "400
+    Client Error: Bad Request for url: https://google.serper.dev/search",
+    which never included Serper's own explanation of why -- exactly where
+    an API states its own reason for rejecting a request. That gap is what
+    made a real, live 2026-09-02 incident (confirmed via the user's own
+    Render logs: EVERY single query failing with this identical error)
+    impossible to diagnose beyond "something about the request is
+    invalid" -- see module docstring's 2026-09-02 section."""
+    payload = {"q": query}
+    if num is not None:
+        payload["num"] = num
+    resp = None
+    try:
+        resp = requests.post(
+            SERPER_ENDPOINT,
+            json=payload,
+            headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
+            timeout=REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        return resp.json(), None
+    except requests.HTTPError as e:
+        body = ""
+        if resp is not None:
+            try:
+                body = resp.text[:500]
+            except Exception:  # noqa: BLE001 - never let logging itself break a search
+                pass
+        return None, f"{e} -- response body: {body!r}"
+    except (requests.RequestException, ValueError) as e:
+        return None, str(e)
+
+
 def _serper_search(query, limit):
     """One query against Serper.dev's Google Search API. Used instead of
     _ddg_search() when SERPER_API_KEY is set -- see module docstring,
@@ -2110,21 +2222,27 @@ def _serper_search(query, limit):
     via Serper's own documented credit rule (2026-08-30 research): a
     query for up to 10 results costs 1 credit; 11-100 costs a flat 2
     credits -- not a per-result cost -- so once a query needs more than
-    10, there's no reason to ask for fewer than 100 (Serper's own max)."""
-    payload = {"q": query}
-    if limit > 10:
-        payload["num"] = min(limit, 100)
-    try:
-        resp = requests.post(
-            SERPER_ENDPOINT,
-            json=payload,
-            headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
-            timeout=REQUEST_TIMEOUT,
+    10, there's no reason to ask for fewer than 100 (Serper's own max).
+
+    Fixed 2026-09-02: the num value actually sent was `min(limit, 100)` --
+    the SMALLER of the two, e.g. 44 for a typical call in this app, not
+    the flat 100 the paragraph above says it should be. That mismatch
+    between the code and its own documented intent lines up with exactly
+    when a real "every single query fails with 400" incident became
+    possible (see module docstring's 2026-09-02 section) -- fixed to send
+    a flat 100, and now retries once with no `num` at all if that fails,
+    so one bad `num` value can never again zero out an entire query's
+    results the way it did that day."""
+    requested_num = 100 if limit > 10 else None
+    data, error = _serper_request(query, requested_num)
+    if data is None and requested_num is not None:
+        logger.warning(
+            "Serper search with num=%s failed for query %r (%s) -- "
+            "retrying without num", requested_num, query, error,
         )
-        resp.raise_for_status()
-        data = resp.json()
-    except (requests.RequestException, ValueError) as e:
-        logger.warning("Serper search failed for query %r: %s", query, e)
+        data, error = _serper_request(query, None)
+    if data is None:
+        logger.warning("Serper search failed for query %r: %s", query, error)
         return [], False
 
     out = []
