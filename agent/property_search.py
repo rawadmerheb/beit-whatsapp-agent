@@ -577,6 +577,46 @@ than guessed at:
    2-credit bracket) -- still a few thousandths of a cent per search on
    Serper's published per-1,000-query pricing, and well within the 2,500
    free queries the account starts with.
+
+A REAL SALE LISTING WRONGLY READ AS A RENTAL (found + fixed 2026-08-30)
+---------------------------------------------------------------------------
+The user asked why a real, live Arkan listing
+(arkanestate.com/properties/luxury-apartment-for-sale-in-jamhour/ --
+confirmed via a direct fetch to be a genuine $670,000 SALE, 5 bed/6 bath)
+never showed up searching Jamhour. Fetched arkanestate.com/area/jamhour/
+directly to see why: Jamhour has exactly ONE real listing, and Arkan
+renders it as a special "Featured" hero widget rather than a normal grid
+card -- with no dedicated <article>/<li> wrapper of its own, sitting in
+the same broad layout container as an unrelated "Latest Listings" sidebar
+that includes a genuine rental ("Apartment for Rent in New Shayleh",
+"$650/month"). _parse_arkan_cards()'s old card-boundary logic (a plain
+find_parent(["article", "div", "li"])) matched whatever <div> was closest
+to the listing's own anchor -- which turned out to be that same wide
+wrapper enclosing the sidebar too. That sidebar's "for rent"/"$650/month"
+text leaked straight into this listing's own rent-vs-sale detection text,
+so a genuine sale listing got flagged is_rent=True and silently excluded
+from every "buy" search for Jamhour -- not a bug in the rent/sale check
+itself, but the text it was reading was scoped far too broadly. This
+wasn't caught earlier because every previously-tested area (Jbeil,
+Achrafieh, Amchit, etc.) has enough real listings to fill a normal grid,
+so the single-listing "Featured hero, no sidebar contamination risk
+tested" case never came up before.
+
+Fixed with _card_and_detection_text() (used by both _parse_arkan_cards()
+and _parse_olx_cards()): tries a tight <article>/<li> ancestor FIRST --
+a far more reliable "this is exactly one card" boundary than a bare
+<div>, which can just as easily be a wide multi-column wrapper holding
+several unrelated things side by side -- and only falls back to a div
+if neither exists. Either way, the text actually used to decide rent-vs-
+sale and extract price/bedrooms/age is capped at CARD_DETECTION_TEXT_CAP
+(600 characters): a genuine single card's own teaser is always
+comfortably under that, so a match far longer than that is itself a
+sign the boundary was too broad, and text past the cap isn't trusted.
+Verified against a reconstruction of the actual Jamhour page structure
+(a shared wide div holding both the featured listing and the
+contaminating sidebar rental) plus a regression check that normal,
+properly-wrapped grid cards (the common case on every other page this
+code has been tested against) still parse exactly as before.
 """
 
 import logging
@@ -967,6 +1007,44 @@ def _extract_card_image(card, base_url):
     return None
 
 
+# Added 2026-08-30: confirmed live on arkanestate.com/area/jamhour/ -- an
+# area with exactly ONE real listing, shown as a special "Featured" hero
+# widget rather than a normal grid card, with no dedicated <article>/<li>
+# wrapper of its own. The old plain find_parent(["article", "div", "li"])
+# matched whatever <div> happened to be closest, which on this page turned
+# out to be a wide layout wrapper that ALSO contains an unrelated "Latest
+# Listings" sidebar -- including a genuine rental ("Apartment for Rent in
+# New Shayleh", "$650/month"). That sidebar text leaked straight into this
+# listing's own rent-vs-sale detection text, so a real, live $670,000 SALE
+# listing (5 bed/6 bath, confirmed via a direct fetch) got wrongly flagged
+# as a rental and silently excluded from every "buy"/sale search for
+# Jamhour -- not because of a bug in the rent/sale logic itself, but
+# because the text it was reading was scoped too broadly. <article> and
+# <li> are far more reliable "this is exactly one card" boundaries than a
+# bare <div>, which can just as easily be a multi-column layout wrapper
+# holding several unrelated things side by side -- so those are tried
+# FIRST now, falling back to a bare div only if neither exists.
+# CARD_DETECTION_TEXT_CAP is a second, cheaper safety net for that
+# fallback case: a genuine single card's own teaser text is always
+# comfortably under this; text far longer than that is itself a sign the
+# match was too broad, so anything past the cap isn't trusted for
+# deciding rent-vs-sale or extracting price/bedrooms/age.
+CARD_DETECTION_TEXT_CAP = 600
+
+
+def _card_and_detection_text(a, fallback_tags=("article", "div", "li")):
+    """Given a listing's own anchor tag, returns (card, detection_text):
+    `card` is the best-guess element representing just this one listing
+    (used for e.g. pulling its own <img> via _extract_card_image), and
+    `detection_text` is the safely-bounded text actually used to decide
+    rent-vs-sale and extract price/bedrooms/age for THIS card specifically
+    -- see CARD_DETECTION_TEXT_CAP above for why this exists."""
+    tight = a.find_parent(["article", "li"])
+    card = tight or a.find_parent(list(fallback_tags)) or a
+    text = card.get_text(" ", strip=True)
+    return card, text[:CARD_DETECTION_TEXT_CAP]
+
+
 def _parse_arkan_cards(html, transaction_type, property_type,
                         min_price, max_price, limit):
     """Parses Arkan's location-archive card grid. Does NOT filter by
@@ -981,8 +1059,7 @@ def _parse_arkan_cards(html, transaction_type, property_type,
         if not title:
             continue
 
-        card = a.find_parent(["article", "div", "li"]) or a
-        text_block = card.get_text(" ", strip=True)
+        card, text_block = _card_and_detection_text(a)
 
         lower = text_block.lower()
         # Arkan's location archive pages mix buy/rent/land together --
@@ -1625,8 +1702,13 @@ def _parse_olx_cards(html, property_type, limit):
             continue
         seen_urls.add(full_url)
 
-        card = a.find_parent(["li", "article", "div"]) or a
-        text_block = card.get_text(" ", strip=True)
+        # Same reasoning as _parse_arkan_cards()'s 2026-08-30 fix -- see
+        # _card_and_detection_text()'s docstring: prefer a tight
+        # <article>/<li> card boundary over a bare <div>, and cap the
+        # text actually used for price/bedroom/age extraction, so this
+        # card's own data can't get contaminated by an unrelated
+        # sibling card/widget sharing the same broad wrapping div.
+        card, text_block = _card_and_detection_text(a)
         lower = text_block.lower()
         if property_type and property_type.lower() not in lower:
             continue
