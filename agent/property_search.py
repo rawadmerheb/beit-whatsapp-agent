@@ -440,7 +440,7 @@ reached them as a result. Two things converged:
     alone wasn't enough here. Fixed by giving _looks_dead_page() a second,
     positive-evidence check: does this page's text mention an actual price
     ($ or USD/L.L. next to digits) OR a basic property attribute (bedroom,
-    bathroom, sqm/m²/square feet, etc.) ANYWHERE? A real listing page -- on
+    bathroom, sqm/m², square feet, etc.) ANYWHERE? A real listing page -- on
     any site this code scrapes -- always states at least one of those;
     chrome-only/error content never does, regardless of its URL shape or
     however its HTTP status came through the proxy. Deliberately does NOT
@@ -617,6 +617,134 @@ Verified against a reconstruction of the actual Jamhour page structure
 contaminating sidebar rental) plus a regression check that normal,
 properly-wrapped grid cards (the common case on every other page this
 code has been tested against) still parse exactly as before.
+
+"STILL VERY LIMITED, NEED AT LEAST 10, LOOK BACK 6 MONTHS" (2026-08-31)
+---------------------------------------------------------------------------
+Two changes made per the user's direct request, plus one real bug found
+while looking into why a thin area's Arkan results stayed thin even after
+every earlier fix this file already has:
+
+1. A real, confirmed bug in search_arkan()'s own fallback logic: after
+   fetching the area/city's own dedicated archive page(s), this function
+   was only willing to ALSO try Arkan's sitewide search (?s=<area>) as a
+   backup when the dedicated page(s) came back with ZERO listings
+   ("if not candidates:"). Re-fetched arkanestate.com/area/jamhour/ live
+   to confirm the exact scenario: that page renders exactly ONE real
+   listing (still true, same as the previous section), so `candidates`
+   already had 1 item in it and the sitewide-search backup was being
+   skipped entirely -- even though Arkan's own broader search might
+   genuinely have more to offer for that name. A location page that's
+   merely thin (a handful of results, not enough to fill a reply) was
+   being treated exactly like a location page that came back completely
+   empty. Confirmed via a live fetch that this isn't an ARKAN_PAGES_PER_
+   SEARCH problem instead: arkanestate.com/city/beirut/ has only 3 real
+   pagination pages total (page 4 is a genuine 404) and
+   arkanestate.com/city/mount-lebanon/ has only 1 page, period -- so the
+   existing page count (4) already covers every city page in full; the
+   real gap was purely the fallback's trigger condition. Fixed by
+   changing the trigger from "the dedicated page found nothing at all" to
+   "the dedicated page didn't find enough" (len(candidates) < limit) --
+   still fully additive (existing seen_urls dedup prevents duplicates
+   between the two passes) and still skipped once enough real candidates
+   already exist, so this never runs pointless extra fetches when a page
+   is already well-stocked (e.g. Beirut, Jbeil).
+
+2. RECENCY_WINDOW_DAYS raised from 120 to 180 (6 months) per the user's
+   explicit ask to widen how far back this code looks before treating a
+   listing as anything other than fully fresh. To be precise about what
+   this constant actually controls (it's the same rule as the 2026-08-29
+   "last 120 days" section above, just with a wider window now): it is
+   purely a _score_result() ranking nudge, never an exclusion filter --
+   this file has never dropped a real listing just for being old, and
+   still doesn't. Raising it to 180 means a real listing confirmed posted
+   between 4 and 6 months ago now gets the same small freshness bonus a
+   listing posted last week gets, instead of the small penalty it used to
+   get in that 120-180 day range -- so more real, slightly-older listings
+   can now rank into the top results instead of being nudged down.
+
+One honest limit worth stating plainly: neither change manufactures
+listings that don't exist. "At least 10 options" is now genuinely more
+achievable wherever 10 real matching listings exist somewhere across
+Arkan/OLX/the curated portals/the open web -- the Jamhour-style fallback
+fix in particular closes a real gap that was silently capping some areas
+below what Arkan itself actually has to offer. But an area that
+genuinely, verifiably has only 2 or 3 real listings anywhere right now
+will still only ever show 2 or 3 -- this code has never fabricated a
+result and still won't.
+
+"ONLY ONE SITE SHOWS UP, AND ARKAN/CONFIDENCE ARE MISSING" (2026-09-01)
+---------------------------------------------------------------------------
+The user reported the previous round's fixes weren't enough: results were
+still dominated by a single site (this time a well-indexed newer app,
+DoorEast -- confirmed real via a live search, not this file's own scraper)
+with nothing from Arkan or Confidence Real Estate even though the user had
+personally checked both and found real matching listings there. Two
+separate, confirmed root causes -- neither guessed at:
+
+1. A real, confirmed bug: confidencerealestate.com is entirely
+   client-side-JS-rendered, the same wall OLX had (see the 2026-08-26
+   section above), just never diagnosed for this specific site until now.
+   Confirmed by directly fetching THREE different pages on it -- the
+   homepage, a /property-location/batroun/ archive, AND a real individual
+   listing page (confidencerealestate.com/property/an-ideal-120-sqm-
+   apartment-with-a-360-sqm-roof-for-sale/, found via a live Google
+   search) -- every single one came back as nothing but a bare <head>
+   full of meta tags, zero real body content. That means every time this
+   code ever found a real Confidence listing (via a Serper/DuckDuckGo
+   site: query -- Confidence isn't scraped directly the way Arkan is),
+   the very next step (_finalize_and_enrich's dead-page check, or
+   _resolve_bedrooms's detail-page confirmation) fetched that candidate's
+   own page PLAIN (no rendering), saw the same blank shell, and dropped
+   it as "dead" -- discarding a real, live listing every single time,
+   with zero exceptions. Fixed by adding confidencerealestate.com to
+   RENDER_REQUIRED_DOMAINS, and splitting that set into two: Arkan/OLX
+   (DIRECTLY_SCRAPED_DOMAINS -- their own dedicated scraper already
+   fetched this exact page fresh, with render=True, moments earlier in
+   the same request, so _finalize_and_enrich can safely skip re-checking
+   them) versus everything else needing render (Confidence, currently) --
+   which DOES still need an active check here, just with render=True
+   instead of being skipped or wrongly plain-fetched. See
+   DIRECTLY_SCRAPED_DOMAINS and _finalize_and_enrich()'s own docstring.
+
+2. A real, confirmed design gap: nothing anywhere in this file capped how
+   many of the FINAL results could come from one single domain. Confirmed
+   by reading the merge/ranking code directly -- _rank_and_fill() scored
+   every candidate purely on match quality/freshness/price/features (see
+   _score_result), with no notion of "which site is this" at all, so
+   whichever single site happened to be best-indexed by Google for a
+   given area/query (JSK before, DoorEast this time -- there is nothing
+   special about either site itself; it's purely a function of that
+   site's own SEO strength for that particular query) could end up
+   filling most or all of the final list on its own, silently crowding
+   out real candidates from Arkan, Confidence, or any other source even
+   when they genuinely had matching listings too. Fixed with
+   MAX_RESULTS_PER_DOMAIN: a cap of 3, applied identically to every
+   domain including Arkan itself (no site is ever exempted from it,
+   consistent with this file's existing "no site is ever favored" rule),
+   enforced in _rank_and_fill()'s per-domain-aware add_fn calls. Paired
+   with a deliberate "overflow" fallback pass (see _rank_and_fill()'s own
+   docstring) so the cap only ever enforces diversity that's actually
+   available -- it never trims the final list down below what real
+   candidates exist just to make room for sources that have nothing to
+   offer for that specific query.
+
+Also, per the user's explicit "10-15 properties" ask: search_properties()'s
+own default `limit` was raised from 10 to 12 (landed in the middle of that
+range, not the top of it, to keep the extra concurrent detail-page/
+dead-page checks this now routes through _finalize_and_enrich -- more real
+candidates now survive to that stage -- from stacking too much additional
+latency on top of the render-heavy Arkan/OLX/Confidence fetches already
+happening in the same request). The two matching "show up to 10" lines in
+agent/system_prompt.py, and the tool description string in
+agent/claude_client.py, were updated to say 12 too -- otherwise the model
+would keep truncating its own reply to 10 regardless of how many the tool
+actually returns.
+
+Same honest limit as every round before this one: these fixes make real
+site diversity and a fuller count achievable wherever multiple real
+sources genuinely have matching listings for a given query. They do not
+fabricate a 4th, 5th, or 6th source out of nothing when a specific area
+truly only has real listings on one or two sites right now.
 """
 
 import logging
@@ -838,6 +966,17 @@ DDG_BEDROOM_DETAIL_FETCH_CAP = 6
 # best-first, so the extras are only ever used to backfill a dropped
 # slot, never to bump a genuinely worse result ahead of a better one).
 RESULT_RESERVOIR_BUFFER = 10
+# Added 2026-09-01: no site (see _rank_and_fill()) was ever explicitly
+# favored in ranking, but nothing capped how many of the FINAL results
+# could come from one single domain either -- so whichever one site
+# happened to be best-indexed by Google for a given area/query (JSK
+# before, a newer app called DoorEast this time -- see module docstring)
+# could fill most or all of the list on its own, crowding out real
+# candidates from Arkan, Confidence, or anywhere else. Applied identically
+# to every domain, Arkan included -- see _rank_and_fill()'s docstring for
+# the "overflow" pass that keeps this from ever trimming the list below
+# what real candidates genuinely exist.
+MAX_RESULTS_PER_DOMAIN = 3
 # See module docstring's 2026-08-29 "WHY DO I ONLY EVER GET JSK FIRST?"
 # section -- one giant OR-of-all-curated-portals query let Google's own
 # ranking crowd out every site but the strongest one. Splitting
@@ -849,8 +988,10 @@ OTHER_PORTALS_CHUNK_SIZE = 5
 # an age confirmed OLDER than this is deprioritized, never excluded
 # outright (a listing with no confirmed age at all is neither -- most
 # sites this code scrapes don't expose a date, and that's not evidence of
-# anything).
-RECENCY_WINDOW_DAYS = 120
+# anything). Bumped from 120 to 180 (2026-08-31) per the user's explicit
+# request to widen this to 6 months -- see module docstring's 2026-08-31
+# section. Still never an exclusion filter, only a ranking nudge.
+RECENCY_WINDOW_DAYS = 180
 
 
 def _slugify(text):
@@ -1151,11 +1292,35 @@ SCRAPER_API_ENDPOINT = "https://api.scraperapi.com/"
 # the same chat reply (the initial archive-page fetch, then a detail-page
 # fetch to confirm bedroom count -- see BEDROOM_DETAIL_FETCH_CAP below).
 SCRAPER_API_RENDER_TIMEOUT = 70
-# Only these two are confirmed to need a real rendering browser (see
-# _needs_render()) -- every other fetch still goes through ScraperAPI's
-# proxy when the key is set (for its non-datacenter IP alone), just
-# without paying render's extra cost/latency.
-RENDER_REQUIRED_DOMAINS = ("arkanestate.com", "olx.com.lb")
+# Confirmed to need a real rendering browser (see _needs_render()) --
+# every other fetch still goes through ScraperAPI's proxy when the key is
+# set (for its non-datacenter IP alone), just without paying render's
+# extra cost/latency. confidencerealestate.com added 2026-09-01 -- a live
+# fetch of THREE different pages on that site (homepage, a
+# /property-location/batroun/ archive, and a real individual
+# /property/<slug>/ listing page found via a live Google search) each
+# came back as nothing but a bare <head> full of meta tags -- the same
+# client-side-JS-only wall OLX has (see the 2026-08-26 section above),
+# just never diagnosed for this specific site until now. See
+# DIRECTLY_SCRAPED_DOMAINS below and _finalize_and_enrich() for why this
+# one still needs an active check (unlike Arkan/OLX) rather than being
+# skipped outright.
+RENDER_REQUIRED_DOMAINS = (
+    "arkanestate.com", "olx.com.lb", "confidencerealestate.com",
+)
+
+# Of the domains above, these two already get a guaranteed-FRESH
+# render=True fetch of the exact page a candidate came from, moments
+# earlier in this same request, via their own dedicated scraper
+# (search_arkan() / _scrape_olx_cards()) -- so _finalize_and_enrich() can
+# safely skip re-checking them (see its own docstring). Confidence is
+# deliberately NOT in this set: its candidates are only ever discovered
+# secondhand, via a Serper/DuckDuckGo search hit -- this code has never
+# actually fetched that specific listing page itself before that point,
+# so it genuinely needs the check (with render=True, not skipped and not
+# plain-fetched) to tell a real live listing apart from a genuinely dead
+# one.
+DIRECTLY_SCRAPED_DOMAINS = ("arkanestate.com", "olx.com.lb")
 
 # Serper.dev returns real Google search results as plain JSON -- replaces
 # the DuckDuckGo HTML scrape entirely when set, since DuckDuckGo's own
@@ -1171,6 +1336,20 @@ def _needs_render(url):
     RENDER_REQUIRED_DOMAINS), rather than a plain proxied fetch?"""
     domain = urlparse(url).netloc.lower()
     return any(d in domain for d in RENDER_REQUIRED_DOMAINS)
+
+
+def _is_directly_scraped(url):
+    """Does this URL belong to a site whose own dedicated scraper
+    (search_arkan() / _scrape_olx_cards()) already fetched THIS exact
+    page, fresh, with render=True, earlier in this same request? See
+    DIRECTLY_SCRAPED_DOMAINS above -- _finalize_and_enrich() uses this to
+    skip a pointless re-check for those two, while still actively
+    checking a RENDER_REQUIRED_DOMAINS site that ISN'T in this set (e.g.
+    Confidence Real Estate), whose candidates only ever arrive secondhand
+    via a search hit and have never actually been fetched by this code
+    before that point."""
+    domain = urlparse(url).netloc.lower()
+    return any(d in domain for d in DIRECTLY_SCRAPED_DOMAINS)
 
 
 def _fetch(url, timeout=REQUEST_TIMEOUT, retries=1, render=False):
@@ -1587,7 +1766,19 @@ def search_arkan(area, transaction_type="sale", property_type=None,
                 seen_urls.add(item["url"])
                 candidates.append(item)
 
-    if not candidates:
+    # Changed 2026-08-31 from "if not candidates:" (only ran when the
+    # location page(s) above found ZERO listings at all) to "thin, not
+    # just empty" -- confirmed live on arkanestate.com/area/jamhour/:
+    # that page has exactly ONE real listing, so `candidates` already had
+    # 1 item and this whole fallback was being skipped entirely, even
+    # though Arkan's own sitewide search might well have more (nearby
+    # listings, a differently-tagged area, etc.) to add. The user asked
+    # for at least 10 real options whenever they exist -- a location page
+    # that's merely thin (1-9 results) is exactly the case this fallback
+    # needs to run for, not just a location page that came back fully
+    # empty. Still fully additive (seen_urls below prevents duplicates)
+    # and still skipped once `candidates` already has enough.
+    if len(candidates) < limit:
         fallback_url = f"{ARKAN_BASE}/?s={area}"
         html = _fetch(fallback_url, render=True, retries=0)
         if html and _looks_like_bot_challenge(html):
@@ -2214,11 +2405,25 @@ def _score_result(item, index_in_source, bedrooms, min_price, max_price):
 def _rank_and_fill(pool, arkan_items, market_items, bedrooms, min_price,
                     max_price, limit, add_fn):
     """Scores a combined Arkan+market candidate pool by _score_result() and
-    adds the best ones to `pool` (via add_fn, which also dedupes) until it
-    reaches `limit`. Interleaves Arkan/market before scoring (rather than
-    concatenating one after the other) purely so that an exact score tie
-    breaks evenly between sources instead of one side consistently winning
-    ties -- the actual order is driven by score, not by source."""
+    adds the best ones to `pool` (via add_fn, which also dedupes AND, as of
+    2026-09-01, enforces MAX_RESULTS_PER_DOMAIN -- see its own docstring)
+    until it reaches `limit`. Interleaves Arkan/market before scoring
+    (rather than concatenating one after the other) purely so that an
+    exact score tie breaks evenly between sources instead of one side
+    consistently winning ties -- the actual order is driven by score, not
+    by source.
+
+    Added 2026-09-01: a second "overflow" pass runs after the first if the
+    per-domain cap left `pool` short of `limit`. add_fn returning False can
+    mean either a true duplicate (never retried) or only "this domain is
+    already at its cap" (retried here, this time with force=True, which
+    bypasses the cap but never the dedupe check). This is deliberate: the
+    cap's whole job is to stop one domain from crowding out real
+    candidates from OTHER domains -- never to make a reply come back
+    shorter than it could genuinely be. When there simply aren't enough
+    distinct domains with real matches for this query, the overflow pass
+    still fills the list up with the next-best real candidates regardless
+    of domain, exactly as this worked before the cap existed."""
     interleaved = []
     for i in range(max(len(arkan_items), len(market_items))):
         if i < len(market_items):
@@ -2232,10 +2437,17 @@ def _rank_and_fill(pool, arkan_items, market_items, bedrooms, min_price,
     ]
     scored.sort(key=lambda pair: pair[0], reverse=True)
 
+    deferred = []
     for _score, item in scored:
         if len(pool) >= limit:
-            break
-        add_fn(item, pool)
+            return
+        if not add_fn(item, pool):
+            deferred.append(item)
+
+    for item in deferred:
+        if len(pool) >= limit:
+            return
+        add_fn(item, pool, force=True)
 
 
 def _finalize_and_enrich(ranked_candidates, limit):
@@ -2257,22 +2469,27 @@ def _finalize_and_enrich(ranked_candidates, limit):
     already stated it, so _resolve_bedrooms() never opened this one's
     page -- get fetched here.
 
-    That fetch is deliberately a plain, short, non-rendering one
-    (_fetch()'s render=False default, REQUEST_TIMEOUT's ~10s), and is
-    deliberately skipped entirely for Arkan/OLX candidates even when they
-    aren't "_verified": those two sites need a real 70s-class rendering
-    browser to show anything at all (see RENDER_REQUIRED_DOMAINS / module
-    docstring's 2026-08-26 section) -- a plain fetch there wouldn't reveal
-    a real dead link, it would just misread a normal reload-and-wait stub
-    as a dead page and wrongly discard a perfectly live listing."""
+    Skipped entirely for DIRECTLY_SCRAPED_DOMAINS (Arkan/OLX) even when
+    they aren't "_verified": those two sites need a real 70s-class
+    rendering browser to show anything at all (see module docstring's
+    2026-08-26 section), and their own dedicated scraper already fetched
+    this exact page moments ago with render=True -- re-checking here would
+    just cost time for no new information (a plain fetch there wouldn't
+    reveal a real dead link either -- it would just misread a normal
+    reload-and-wait stub as a dead page and wrongly discard a perfectly
+    live listing). Everything else gets an actual fetch here: render=True
+    for a RENDER_REQUIRED_DOMAINS site that ISN'T in DIRECTLY_SCRAPED_
+    DOMAINS (Confidence Real Estate, as of 2026-09-01 -- see that
+    section), otherwise a plain, short, non-rendering one (_fetch()'s
+    render=False default, REQUEST_TIMEOUT's ~10s)."""
     to_check = [
         item for item in ranked_candidates
-        if not item.get("_verified") and not _needs_render(item["url"])
+        if not item.get("_verified") and not _is_directly_scraped(item["url"])
     ]
 
     if to_check:
         def _check(item):
-            return _fetch(item["url"], retries=0)
+            return _fetch(item["url"], render=_needs_render(item["url"]), retries=0)
 
         with ThreadPoolExecutor(max_workers=min(8, len(to_check))) as pool:
             htmls = list(pool.map(_check, to_check))
@@ -2309,7 +2526,7 @@ def _finalize_and_enrich(ranked_candidates, limit):
 
 def search_properties(area, transaction_type="sale", property_type=None,
                        min_price=None, max_price=None, bedrooms=None,
-                       include_public_sources=True, limit=10):
+                       include_public_sources=True, limit=12):
     """Tool entry point called by the Gemini agent. Searches the Lebanese
     market as ONE generic pool: Arkan Estate's site and the wider market
     (OLX, other portals, open web) all run concurrently and get merged into
@@ -2371,18 +2588,26 @@ def search_properties(area, transaction_type="sale", property_type=None,
         }
 
     seen_keys = set()
+    domain_counts = {}
 
     def _dedupe_key(item):
         parsed = urlparse(item["url"])
         domain = parsed.netloc.lower()
         return domain, parsed.path.rstrip("/")
 
-    def _add(item, bucket):
+    def _add(item, bucket, force=False):
         key = _dedupe_key(item)
         if key in seen_keys:
             return False
+        domain = key[0]
+        # See MAX_RESULTS_PER_DOMAIN's 2026-09-01 docstring -- force=True
+        # (only ever passed by _rank_and_fill's own overflow pass) bypasses
+        # the per-domain cap, never the dedupe check above.
+        if not force and domain_counts.get(domain, 0) >= MAX_RESULTS_PER_DOMAIN:
+            return False
         seen_keys.add(key)
-        item.setdefault("domain", key[0])
+        domain_counts[domain] = domain_counts.get(domain, 0) + 1
+        item.setdefault("domain", domain)
         bucket.append(item)
         return True
 
