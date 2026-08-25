@@ -440,7 +440,7 @@ reached them as a result. Two things converged:
     alone wasn't enough here. Fixed by giving _looks_dead_page() a second,
     positive-evidence check: does this page's text mention an actual price
     ($ or USD/L.L. next to digits) OR a basic property attribute (bedroom,
-    bathroom, sqm/m², square feet, etc.) ANYWHERE? A real listing page -- on
+    bathroom, sqm/m²/square feet, etc.) ANYWHERE? A real listing page -- on
     any site this code scrapes -- always states at least one of those;
     chrome-only/error content never does, regardless of its URL shape or
     however its HTTP status came through the proxy. Deliberately does NOT
@@ -925,11 +925,79 @@ before ever being trusted. If a priority domain genuinely has nothing at
 all in EITHER the ranked reservoir OR its own raw output, this still does
 nothing for it -- same honest limit as always, just now checking in the
 right place before giving up.
+
+MISSING ARKAN AND OLX EVEN THOUGH BOTH HAD REAL LISTINGS -- A CONCURRENCY
+LIMIT, NOT A BUG IN THE SEARCH/RANKING LOGIC (found + fixed 2026-09-05)
+---------------------------------------------------------------------------
+The user reported a real search (Ajaltoun, $200K-$380K) came back with only
+ONE result total, and it wasn't from Arkan or OLX. Checked this directly,
+not guessed at: a live fetch of arkanestate.com/area/ajaltoun/ right then
+showed 7 real listings, at least four of them squarely inside that exact
+budget ($210K, $225K, $250K, and a $350K triplex with a terrace -- almost
+exactly what the reply itself had just said it would "keep an eye out for"
+in a follow-up search). Separately, olx.com.lb's own Ajaltoun for-sale
+category page -- the exact page this file scrapes -- is publicly indexed as
+having 414 real listings. Neither site was remotely thin for this area;
+real, live, matching candidates plainly existed on both and never reached
+the reply.
+
+The user also confirmed the account this app uses for ScraperAPI is on
+their free plan, which ScraperAPI's own plans-and-billing documentation
+caps at 5 concurrent connections. Rereading _fetch() with that number in
+mind surfaced something this file's own comments had undersold: EVERY
+fetch this file ever makes routes through that same ScraperAPI account
+whenever SCRAPER_API_KEY is set (see the "if SCRAPER_API_KEY:" branch at
+the top of _fetch()) -- not only the render=True ones. So a single busy
+search's real concurrent load on that one account was never just the
+obvious "Arkan's 4-page batch plus OLX's 1 fetch = 5," already sitting
+exactly at that plan's ceiling -- it also includes, at the same time,
+whatever _resolve_bedrooms() detail-page confirmation is doing (up to 8
+concurrent Arkan/OLX fetches, up to 6 more for DDG-sourced candidates,
+run concurrently WITH each other and WITH Arkan's own page batch, see
+search_market()'s and search_properties()'s own concurrent submissions),
+_finalize_and_enrich()'s thumbnail/dead-page pass over the whole reservoir,
+and (as of 2026-09-04) the priority-domain rescue fetch -- all funneling
+through the exact same 5-connection cap at once. Sitting at or past an
+account's own connection limit like that plausibly means some of those
+requests get rejected or silently dropped by ScraperAPI itself, rather than
+failing in a way this file's existing Arkan/OLX "reached" logging was ever
+built to catch -- and exactly which ones get through can vary run to run
+depending on timing, which matches the user's experience of this looking
+intermittent rather than consistently broken.
+
+Fixed with a single, global concurrency limiter, not a change to any
+ranking/merging/guarantee logic (none of that was ever the problem here):
+_scraper_api_semaphore, a threading.Semaphore sized by
+SCRAPER_API_MAX_CONCURRENCY (see its own comment -- defaults to 4, one
+below the free plan's documented 5-connection cap, and overridable via an
+environment variable with no code change needed once the plan is
+upgraded). Every _fetch() call now acquires this semaphore right before
+actually making its request, but ONLY when SCRAPER_API_KEY is set -- a
+plain, non-proxied fetch has no such account-level limit to respect. No
+matter how many threads across this whole app try to fetch through
+ScraperAPI at the same moment, at most SCRAPER_API_MAX_CONCURRENCY of them
+are ever actually in flight; anything beyond that simply waits its turn
+for a slot instead of firing regardless and risking one of them getting
+rejected.
+
+Honest trade-off, stated plainly: on the free plan, this can make a search
+that needs a lot of individual detail-page fetches (confirming bedroom
+counts, backfilling thumbnails) somewhat SLOWER than before, since fetches
+that used to all race in parallel now sometimes queue for a free slot --
+see the previous, separate conversation about why some searches feel slow
+to begin with. But a slower, complete answer beats a fast one that's
+silently missing real listings that were sitting right there the whole
+time, consistent with this file's history. Upgrading the ScraperAPI plan
+raises the real concurrent-connection ceiling and is the actual fix for
+both the slowness and this limit at once; SCRAPER_API_MAX_CONCURRENCY
+exists specifically so that upgrade can be reflected with an environment
+variable change, not another trip through this file.
 """
 
 import logging
 import os
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse, urljoin, unquote
 
@@ -1485,6 +1553,25 @@ SCRAPER_API_ENDPOINT = "https://api.scraperapi.com/"
 # the same chat reply (the initial archive-page fetch, then a detail-page
 # fetch to confirm bedroom count -- see BEDROOM_DETAIL_FETCH_CAP below).
 SCRAPER_API_RENDER_TIMEOUT = 70
+
+# Added 2026-09-05 -- see module docstring's own 2026-09-05 section for the
+# full, confirmed story. EVERY fetch this file makes (not just the
+# render=True ones) routes through this same ScraperAPI account whenever
+# SCRAPER_API_KEY is set (see the "if SCRAPER_API_KEY:" branch in _fetch()
+# below) -- so the account's own concurrent-connection limit applies across
+# all of them at once: Arkan's own page batch, OLX's fetch, every bedroom-
+# confirmation detail-page fetch, every thumbnail/dead-page enrichment
+# check, and the priority-domain rescue fetch, all sharing the same cap.
+# Confirmed via ScraperAPI's own plans-and-billing docs that their free plan
+# caps an account at 5 concurrent connections -- comfortably below what a
+# single busy search here can actually try to open at once. Default of 4
+# leaves a little headroom under that 5, and is overridable via this
+# environment variable with no code change needed once the plan is
+# upgraded -- raise it to match whatever the new plan's own concurrent-
+# connection limit actually is.
+SCRAPER_API_MAX_CONCURRENCY = int(os.getenv("SCRAPER_API_MAX_CONCURRENCY", "4"))
+_scraper_api_semaphore = threading.Semaphore(SCRAPER_API_MAX_CONCURRENCY)
+
 # Confirmed to need a real rendering browser (see _needs_render()) --
 # every other fetch still goes through ScraperAPI's proxy when the key is
 # set (for its non-datacenter IP alone), just without paying render's
@@ -1601,7 +1688,18 @@ def _fetch(url, timeout=REQUEST_TIMEOUT, retries=1, render=False):
     attempts = retries + 1
     for attempt in range(attempts):
         try:
-            resp = requests.get(request_url, timeout=timeout, **request_kwargs)
+            if SCRAPER_API_KEY:
+                # See SCRAPER_API_MAX_CONCURRENCY's own comment and the
+                # module docstring's 2026-09-05 section: this one account's
+                # concurrent-connection cap applies across EVERY fetch this
+                # file makes, not just this specific one -- so this waits
+                # for a free slot rather than firing regardless and risking
+                # this request getting rejected/dropped by ScraperAPI for
+                # exceeding the account's own limit.
+                with _scraper_api_semaphore:
+                    resp = requests.get(request_url, timeout=timeout, **request_kwargs)
+            else:
+                resp = requests.get(request_url, timeout=timeout, **request_kwargs)
             resp.raise_for_status()
             return resp.text
         except requests.HTTPError as e:
