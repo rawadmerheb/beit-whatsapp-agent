@@ -631,23 +631,23 @@ every earlier fix this file already has:
    ("if not candidates:"). Re-fetched arkanestate.com/area/jamhour/ live
    to confirm the exact scenario: that page renders exactly ONE real
    listing (still true, same as the previous section), so `candidates`
-   already had 1 item in it and the sitewide-search backup was being
-   skipped entirely -- even though Arkan's own broader search might
-   genuinely have more to offer for that name. A location page that's
-   merely thin (a handful of results, not enough to fill a reply) was
-   being treated exactly like a location page that came back completely
-   empty. Confirmed via a live fetch that this isn't an ARKAN_PAGES_PER_
-   SEARCH problem instead: arkanestate.com/city/beirut/ has only 3 real
-   pagination pages total (page 4 is a genuine 404) and
-   arkanestate.com/city/mount-lebanon/ has only 1 page, period -- so the
-   existing page count (4) already covers every city page in full; the
-   real gap was purely the fallback's trigger condition. Fixed by
-   changing the trigger from "the dedicated page found nothing at all" to
-   "the dedicated page didn't find enough" (len(candidates) < limit) --
-   still fully additive (existing seen_urls dedup prevents duplicates
-   between the two passes) and still skipped once enough real candidates
-   already exist, so this never runs pointless extra fetches when a page
-   is already well-stocked (e.g. Beirut, Jbeil).
+   already had 1 item and this whole fallback was being skipped entirely,
+   even though Arkan's own broader search might genuinely have more to
+   offer for that name. A location page that's merely thin (a handful of
+   results, not enough to fill a reply) was being treated exactly like a
+   location page that came back completely empty. Confirmed via a live
+   fetch that this isn't an ARKAN_PAGES_PER_SEARCH problem instead:
+   arkanestate.com/city/beirut/ has only 3 real pagination pages total
+   (page 4 is a genuine 404) and arkanestate.com/city/mount-lebanon/ has
+   only 1 page, period -- so the existing page count (4) already covers
+   every city page in full; the real gap was purely the fallback's
+   trigger condition. Fixed by changing the trigger from "the dedicated
+   page found nothing at all" to "the dedicated page didn't find enough"
+   (len(candidates) < limit) -- still fully additive (existing seen_urls
+   dedup prevents duplicates between the two passes) and still skipped
+   once enough real candidates already exist, so this never runs
+   pointless extra fetches when a page is already well-stocked (e.g.
+   Beirut, Jbeil).
 
 2. RECENCY_WINDOW_DAYS raised from 120 to 180 (6 months) per the user's
    explicit ask to widen how far back this code looks before treating a
@@ -812,6 +812,67 @@ bug that didn't match its own documented intent. It can't guarantee
 Serper's API has no OTHER, still-undiscovered rejection reason -- that's
 exactly why point 2 above exists: so the next failure, if there is one,
 shows its real cause in the logs instead of requiring another guess.
+
+WIDER FRESHNESS WINDOW, AND A REAL GUARANTEE FOR ARKAN/CONFIDENCE
+(2026-09-03)
+---------------------------------------------------------------------------
+With the Serper fix above live and results flowing again, the user asked
+for two further, explicit changes:
+
+1. Widen how far back this code looks before treating a listing as
+   anything other than fully fresh, from 6 months to a full 12.
+   RECENCY_WINDOW_DAYS raised from 180 to 365 -- same rule as every prior
+   change to this constant (see the 2026-08-29 and 2026-08-31 sections
+   above): a ranking nudge in _score_result() only, never an exclusion
+   filter. This file has never dropped a real listing just for being old,
+   and still doesn't -- a listing confirmed posted anywhere in the last
+   12 months now gets the same small freshness bonus a listing posted
+   last week gets, instead of the small penalty it used to get past the
+   6-month mark.
+
+2. "Always bring an option from Arkan Estate and Confidence." This is a
+   real, deliberate change to how results get chosen, not just a bigger
+   number: up to this point, Arkan and Confidence were searched for
+   exactly the same as every other site and then subjected to the same
+   score-based ranking and MAX_RESULTS_PER_DOMAIN cap as everything else
+   (see the 2026-09-01 section above) -- which means it was always
+   possible, by design, for either one to be out-scored entirely by other
+   sites' results and not appear in a reply at all, even when it had a
+   real, live, matching listing. That's exactly what "no site is ever
+   favored" was built to allow, and it was working as intended -- the
+   user is now explicitly asking for a narrow, named exception to that
+   rule for these two specific sources.
+
+   Implemented as a guarantee step that runs AFTER ranking and dead-page
+   filtering, not as a ranking boost baked into _score_result() -- a
+   ranking boost would just shuffle these two higher in the score order,
+   which doesn't guarantee anything if enough other real candidates still
+   out-score them. _ensure_priority_domains() instead looks at the final,
+   already-ranked, already-dead-page-filtered candidate pool directly: if
+   the top `limit` results don't already include a live Arkan and/or
+   Confidence result, and one exists ANYWHERE further down that same
+   pool (i.e. it was found and confirmed alive, just ranked below the
+   cutoff), it gets promoted into the reply, swapping out the
+   currently-lowest-ranked result to make room. This only ever costs one
+   slot per missing priority domain, and only when that domain actually
+   has zero live results in the pool the user would otherwise have seen.
+
+   Deliberately does NOT touch _finalize_and_enrich()'s dead-page
+   filtering or _rank_and_fill()'s scoring/domain-cap logic at all --
+   those still run exactly as before, for every site including these two.
+   _finalize_and_enrich() itself was changed only to stop trimming its
+   own output to `limit` (it now returns the full, alive-filtered,
+   best-first reservoir) so the guarantee step below it has real spare
+   candidates to promote from; the actual trim to `limit` now happens in
+   search_properties() after the guarantee step runs.
+
+   Same honest limit as this file has always held to: this guarantees
+   representation only when a real, live listing genuinely exists
+   somewhere in the ranked pool. If Arkan's site couldn't be reached at
+   all for this search, or Confidence genuinely has nothing matching,
+   nothing gets fabricated to fill that slot -- the reply simply won't
+   have one, the same as it wouldn't for any other source with nothing
+   real to offer.
 """
 
 import logging
@@ -1055,10 +1116,23 @@ OTHER_PORTALS_CHUNK_SIZE = 5
 # an age confirmed OLDER than this is deprioritized, never excluded
 # outright (a listing with no confirmed age at all is neither -- most
 # sites this code scrapes don't expose a date, and that's not evidence of
-# anything). Bumped from 120 to 180 (2026-08-31) per the user's explicit
-# request to widen this to 6 months -- see module docstring's 2026-08-31
-# section. Still never an exclusion filter, only a ranking nudge.
-RECENCY_WINDOW_DAYS = 180
+# anything). Bumped from 120 to 180 (2026-08-31), then to 365 (2026-09-03)
+# per the user's explicit request to widen this to a full 12 months -- see
+# module docstring's 2026-09-03 section. Still never an exclusion filter,
+# only a ranking nudge.
+RECENCY_WINDOW_DAYS = 365
+
+# Added 2026-09-03 per the user's explicit request that Arkan Estate and
+# Confidence Real Estate always be represented in a reply, not merely
+# subject to the same score-based ranking and MAX_RESULTS_PER_DOMAIN cap
+# as every other site -- see module docstring's 2026-09-03 section and
+# _ensure_priority_domains() for the guarantee logic itself. This is a
+# deliberate, narrow exception to this file's long-standing "no site is
+# ever favored" rule (see MAX_RESULTS_PER_DOMAIN and _score_result above),
+# made only because the user explicitly asked for it, and scoped to
+# "guarantee presence when a real one exists" -- it never fabricates a
+# result for a domain that genuinely has none.
+PRIORITY_DOMAINS = ("arkanestate.com", "confidencerealestate.com")
 
 
 def _slugify(text):
@@ -1837,14 +1911,14 @@ def search_arkan(area, transaction_type="sale", property_type=None,
     # location page(s) above found ZERO listings at all) to "thin, not
     # just empty" -- confirmed live on arkanestate.com/area/jamhour/:
     # that page has exactly ONE real listing, so `candidates` already had
-    # 1 item in it and the sitewide-search backup was being skipped
-    # entirely, even though Arkan's own sitewide search might well have
-    # more (nearby listings, a differently-tagged area, etc.) to add. The
-    # user asked for at least 10 real options whenever they exist -- a
-    # location page that's merely thin (1-9 results) is exactly the case
-    # this fallback needs to run for, not just a location page that came
-    # back fully empty. Still fully additive (seen_urls below prevents
-    # duplicates) and still skipped once `candidates` already has enough.
+    # 1 item and this whole fallback was being skipped entirely, even
+    # though Arkan's own sitewide search might well have more (nearby
+    # listings, a differently-tagged area, etc.) to add. The user asked
+    # for at least 10 real options whenever they exist -- a location page
+    # that's merely thin (1-9 results) is exactly the case this fallback
+    # needs to run for, not just a location page that came back fully
+    # empty. Still fully additive (seen_urls below prevents duplicates)
+    # and still skipped once `candidates` already has enough.
     if len(candidates) < limit:
         fallback_url = f"{ARKAN_BASE}/?s={area}"
         html = _fetch(fallback_url, render=True, retries=0)
@@ -2568,13 +2642,12 @@ def _rank_and_fill(pool, arkan_items, market_items, bedrooms, min_price,
         add_fn(item, pool, force=True)
 
 
-def _finalize_and_enrich(ranked_candidates, limit):
+def _finalize_and_enrich(ranked_candidates):
     """Last stop before a ranked candidate pool becomes the actual reply:
-    drops anything that turns out to be a broken/blank page, backfills a
-    thumbnail for whatever candidate doesn't already have one, and trims
-    the (deliberately oversized, see RESULT_RESERVOIR_BUFFER) pool down to
-    exactly `limit` -- all without ever demoting a better-ranked real
-    result in favor of a worse one that merely happened to get checked.
+    drops anything that turns out to be a broken/blank page and backfills
+    a thumbnail for whatever candidate doesn't already have one -- all
+    without ever demoting a better-ranked real result in favor of a worse
+    one that merely happened to get checked.
 
     `ranked_candidates` must already be in best-first order (this never
     re-sorts). Most items arrive already "_verified" -- either their own
@@ -2599,7 +2672,18 @@ def _finalize_and_enrich(ranked_candidates, limit):
     for a RENDER_REQUIRED_DOMAINS site that ISN'T in DIRECTLY_SCRAPED_
     DOMAINS (Confidence Real Estate, as of 2026-09-01 -- see that
     section), otherwise a plain, short, non-rendering one (_fetch()'s
-    render=False default, REQUEST_TIMEOUT's ~10s)."""
+    render=False default, REQUEST_TIMEOUT's ~10s).
+
+    Changed 2026-09-03: no longer trims the result down to a `limit` --
+    this now runs its dead-page check/enrichment pass over the WHOLE
+    (deliberately oversized, see RESULT_RESERVOIR_BUFFER) reservoir and
+    hands back every surviving real, live candidate, still in best-first
+    order. Trimming used to happen right here, but that meant a real,
+    live Arkan/Confidence candidate ranked just below the cutoff was
+    already gone by the time anything downstream could act on it. Now
+    search_properties() runs _ensure_priority_domains() on this full,
+    already-checked list BEFORE trimming to `limit` -- see that function
+    and module docstring's 2026-09-03 section for why."""
     to_check = [
         item for item in ranked_candidates
         if not item.get("_verified") and not _is_directly_scraped(item["url"])
@@ -2630,16 +2714,96 @@ def _finalize_and_enrich(ranked_candidates, limit):
                 if detail_days_old is not None:
                     item["days_old"] = detail_days_old
 
-    final = []
+    alive = []
     for item in ranked_candidates:
         if item.get("_dead"):
             continue
         item.pop("_verified", None)
         item.pop("_dead", None)
-        final.append(item)
-        if len(final) >= limit:
-            break
-    return final
+        alive.append(item)
+    return alive
+
+
+def _priority_domain_of(item):
+    """Which PRIORITY_DOMAINS entry (if any) does this item's own URL
+    belong to? Matches by substring against the URL's actual netloc
+    (same robust pattern as _needs_render()/_is_directly_scraped() above)
+    rather than the item's own "domain" field, so this still works
+    correctly even if that field ever ends up "www."-prefixed or
+    otherwise not byte-identical to the bare PRIORITY_DOMAINS string."""
+    domain = urlparse(item["url"]).netloc.lower()
+    for pd in PRIORITY_DOMAINS:
+        if pd in domain:
+            return pd
+    return None
+
+
+def _ensure_priority_domains(alive_candidates, limit):
+    """Guarantees that Arkan Estate and Confidence Real Estate each have at
+    least one real, live result inside the final `limit`-sized reply
+    whenever either one actually has ANY real, live candidate ANYWHERE in
+    `alive_candidates` (the full, already dead-page-filtered,
+    already best-first-ranked reservoir _finalize_and_enrich() hands
+    back) -- even if that candidate ranked below what the top `limit`
+    would otherwise have included. See PRIORITY_DOMAINS and module
+    docstring's 2026-09-03 section for why this deliberate, narrow
+    exception to this file's "no site is ever favored" ranking rule
+    exists: the user explicitly asked for these two specific sources to
+    always be represented, not just be subject to the same score-based
+    ranking/MAX_RESULTS_PER_DOMAIN cap as everything else.
+
+    Only ever costs ONE slot per missing priority domain -- the
+    currently-lowest-ranked slot not already spoken for by an earlier
+    promotion in this same call -- and only when that domain has zero
+    live results in the top `limit` already. Never fabricates a result:
+    if a priority domain genuinely has no real, live candidate anywhere
+    in `alive_candidates` (its own site couldn't be reached, or it
+    genuinely has nothing matching this query), this does nothing for
+    that domain, exactly the same "never invent what isn't there" rule as
+    everywhere else in this file.
+
+    Returns the full list (still oversized) with priority-domain
+    candidates promoted into the first `limit` positions where needed --
+    the caller trims to `limit` afterward."""
+    top = list(alive_candidates[:limit])
+    rest = list(alive_candidates[limit:])
+    protected = set()
+
+    for domain in PRIORITY_DOMAINS:
+        already_present = False
+        for i, item in enumerate(top):
+            if _priority_domain_of(item) == domain:
+                protected.add(i)
+                already_present = True
+        if already_present:
+            continue
+
+        promoted = None
+        for i, item in enumerate(rest):
+            if _priority_domain_of(item) == domain:
+                promoted = rest.pop(i)
+                break
+        if promoted is None:
+            # Genuinely nothing from this domain anywhere in the ranked
+            # pool -- an honest limit, not something to fabricate around.
+            continue
+
+        victim_idx = next(
+            (i for i in range(len(top) - 1, -1, -1) if i not in protected),
+            None,
+        )
+        if victim_idx is None:
+            top.append(promoted)
+            protected.add(len(top) - 1)
+        else:
+            logger.info(
+                "_ensure_priority_domains: promoting %s (no live %s result "
+                "made the top %d on ranking alone)", promoted["url"], domain, limit,
+            )
+            top[victim_idx] = promoted
+            protected.add(victim_idx)
+
+    return top + rest
 
 
 def search_properties(area, transaction_type="sale", property_type=None,
@@ -2665,6 +2829,16 @@ def search_properties(area, transaction_type="sale", property_type=None,
     match is never indistinguishable from an exact one. This is what makes
     a reply show real listings directly far more often, instead of falling
     back to "couldn't find anything" whenever an exact match is thin.
+
+    Added 2026-09-03: Arkan Estate and Confidence Real Estate are each
+    guaranteed to appear at least once in the returned "results" whenever
+    either has a real, live candidate anywhere in the ranked pool -- a
+    deliberate, narrow exception to the "no site is ever favored" ranking
+    rule above, made only because the user explicitly asked these two
+    sources always be represented (see PRIORITY_DOMAINS and
+    _ensure_priority_domains()). This never fabricates a result for either
+    one -- if a source genuinely has nothing real to offer for this query,
+    nothing fills that slot.
 
     Pass include_public_sources=False to search Arkan's site alone.
     """
@@ -2753,11 +2927,25 @@ def search_properties(area, transaction_type="sale", property_type=None,
             bedrooms, min_price, max_price, reservoir_limit, _add,
         )
 
-    # Final pass: drop anything that turns out to be a broken/blank page,
-    # backfill a thumbnail for whatever candidate doesn't already have
-    # one, and trim the (deliberately oversized) reservoir down to exactly
-    # `limit` real, live results -- see _finalize_and_enrich().
-    merged = _finalize_and_enrich(merged, limit)
+    # Final pass: drop anything that turns out to be a broken/blank page
+    # and backfill a thumbnail for whatever candidate doesn't already have
+    # one -- see _finalize_and_enrich(). Changed 2026-09-03: this no
+    # longer trims to `limit` itself (see that function's own docstring)
+    # -- _ensure_priority_domains() below needs the full, still-oversized,
+    # already-alive-filtered reservoir to promote from, and the actual
+    # trim to `limit` happens after that runs.
+    merged = _finalize_and_enrich(merged)
+
+    # Guarantees Arkan Estate and Confidence Real Estate each appear at
+    # least once in the reply whenever either has a real, live result
+    # anywhere in the ranked pool -- see PRIORITY_DOMAINS and
+    # _ensure_priority_domains()'s own docstring, and module docstring's
+    # 2026-09-03 section for why this explicit exception to "no site is
+    # ever favored" exists (the user asked for it directly). Runs AFTER
+    # ranking and dead-page filtering, so it only ever promotes a
+    # confirmed-alive candidate, never a fabricated one.
+    merged = _ensure_priority_domains(merged, limit)
+    merged = merged[:limit]
 
     # True only if EVERY source this call actually tried (Arkan, and OLX +
     # both DuckDuckGo queries when include_public_sources is on) failed to
