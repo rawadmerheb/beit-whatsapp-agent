@@ -49,7 +49,7 @@ SEARCH_PROPERTIES_FN = types.FunctionDeclaration(
         "Search for real estate listings across the whole Lebanese "
         "market in one call -- multiple listing sites/agencies are "
         "checked concurrently and merged into a single flat list of up "
-        "to 10 matching properties, already ranked best-first by how well "
+        "to 12 matching properties, already ranked best-first by how well "
         "each one matches the request, how recently it was listed, and "
         "how complete its price/details are -- never by which site it "
         "came from, so no single site is prioritized, ordered first, or "
@@ -185,7 +185,7 @@ def ask_agent(user_text, history=None, max_tool_rounds=4):
         contents.append(types.Content(role="user", parts=response_parts))
 
     return (
-        "That search is taking more steps than expected -- can you narrow it down "
-        "(one area + buy or rent)?",
+        "That search is taking more steps than expected -- can you narrow it "
+        "down (one area + buy or rent)?",
         contents,
     )
